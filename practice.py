@@ -1,0 +1,54 @@
+from __future__ import annotations
+import argparse, os, json
+from datetime import datetime, timezone
+from src.aaa.exp.dataio import load_data
+
+def main():
+    ap = argparse.ArgumentParser(description="Diagnostic check for dataio module")
+    ap.add_argument("--data", required=True, help="file/folder/glob path")
+    ap.add_argument("--limit", type=int, default=5000)
+    args = ap.parse_args()
+
+    outdir = "artifacts/diagnostics/dataio"
+    os.makedirs(outdir, exist_ok=True)
+
+    df = load_data(args.data, limit=args.limit)
+
+    summary = {
+        "module": "dataio",
+        "status": "pass" if len(df) > 0 and df.shape[1] > 0 else "fail",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "inputs": {"path_arg": args.data, "limit": args.limit},
+        "resolved": {
+            "rows_loaded": int(len(df)),
+            "cols_loaded": int(df.shape[1]),
+            "columns_sample": df.columns.tolist()[:10],
+        },
+        "conditions": {
+            "rows_loaded_gt_0": len(df) > 0,
+            "cols_loaded_gt_0": df.shape[1] > 0,
+        },
+        "artifacts": {
+            "sample_csv": f"{outdir}/sample_head.csv",
+            "summary_json": f"{outdir}/summary.json",
+        },
+    }
+
+    df.head(20).to_csv(summary["artifacts"]["sample_csv"], index=False)
+    with open(summary["artifacts"]["summary_json"], "w") as f:
+        json.dump(summary, f, indent=2)
+
+    # Append to global audit log
+    with open("artifacts/diagnostics/audit_log.jsonl", "a") as audit_f:
+        audit_f.write(json.dumps(summary) + "\n")
+
+    print(f"[DataIO] {summary['status'].upper()}: {len(df)} rows, {df.shape[1]} cols")
+    print(f"Artifacts → {outdir}/")
+
+if __name__ == "__main__":
+    main()
+
+
+python -m src.aaa.diagnostics.dataio_check \
+  --data data_stream/processed/date_2024-01-*/part-*.parquet \
+  --limit 5000
