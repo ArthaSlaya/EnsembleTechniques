@@ -309,6 +309,19 @@ touch src/aaa/diagnostics/model_zoo_check.py
 
 #................................
 
+# configs/experiments/iforest_cpu.yaml
+algo: isolation_forest
+
+params:
+  n_estimators: 200          # number of trees in the forest
+  max_samples: auto          # number of samples to draw for each base estimator
+  contamination: 0.05        # expected fraction of anomalies in data
+  max_features: 1.0          # fraction of features to draw for each tree
+  bootstrap: false           # whether bootstrap samples are used
+  n_jobs: -1                 # use all CPU cores
+  random_state: 42           # reproducibility
+#................................
+
 from __future__ import annotations
 from typing import Dict, Tuple
 import numpy as np
