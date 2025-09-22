@@ -898,3 +898,16 @@ python -m src.aaa.exp.run_experiment \
   --limit 3000 \
   --topk 50
 
+#=========================================
+import mlflow
+from mlflow.tracking import MlflowClient
+
+mlflow.set_tracking_uri("sqlite:////Users/bells1/Projects/AAA_Pipeline_Practice/mlflow.db")
+client = MlflowClient()
+
+# list deleted, find your experiment
+for e in client.search_experiments(view_type=mlflow.entities.ViewType.DELETED_ONLY):
+    print(e.experiment_id, e.name)
+
+# restore by ID
+client.restore_experiment("<ID>")
