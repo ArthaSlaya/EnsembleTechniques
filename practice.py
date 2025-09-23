@@ -753,7 +753,9 @@ import numpy as np
 import pandas as pd
 import mlflow
 import joblib
+import mlflow.sklearn
 
+from joblib import dump
 from .dataio import load_data
 from .features import load_feature_spec, resolve_feature_columns, select_features, feature_manifest
 from .model_zoo import build_pipeline, anomaly_scores
@@ -848,10 +850,29 @@ def main():
             pipe.fit(X)
         fit_s = time.time() - t1
 
+        # Save and log model
+        os.makedirs('artifacts/models', exist_ok= True)
+        local_model_path = f"artifacts/models/{algo}_{spec['id']}.joblib"
+        dump(pipe, local_model_path)
+
+        # log the model inside the active MLflow run
+        mlflow.sklearn.log_model(
+            sk_model= pipe,
+            artifact_path= 'model'
+        )
+
+        # also register in the Model registry for versioning/staging
+        mlflow.sklearn.log_model(
+            sk_model= pipe,
+            artifact_path= 'model_reg',
+            registered_model_name= f"{algo}_{spec['id']}"
+        )
+
         # Score
         scores = anomaly_scores(algo, pipe, X)
         summ = score_summary(scores)
-        mlflow.log_metrics({
+
+        for k, v in {
             "fit_time_s": fit_s,
             "rows": int(X.shape[0]),
             "score_min": summ["min"],
@@ -859,7 +880,8 @@ def main():
             "score_mean": summ["mean"],
             "score_var": summ["var"],
             "load_time_s": load_s,
-        })
+        }.items():
+            mlflow.log_metric(k, v, step= 0)
 
         # Baseline overlap vs zscore@K
         zscores = _zscore_baseline(Xdf)
@@ -867,7 +889,8 @@ def main():
         a_idx = topk_indices(scores, K)
         z_idx = topk_indices(zscores, K)
         overlap = len(set(a_idx.tolist()) & set(z_idx.tolist())) / float(max(1, K))
-        mlflow.log_metric("overlap_vs_zscore@K", overlap)
+        mlflow.log_param('topk', K)
+        mlflow.log_metric("overlap_vs_zscore_at_K", overlap)
 
         # Export Top-K
         top_df = id_frame.iloc[a_idx].copy()
@@ -916,7 +939,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
 #...................................
 from __future__ import annotations
 import os, json, subprocess, shlex
