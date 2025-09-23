@@ -1,4 +1,353 @@
-algo: isolation_forest
+from __future__ import annotations
+import os, json, time, argparse, yaml, hashlib, subprocess
+from datetime import datetime, timezone
+import numpy as np
+import pandas as pd
+import mlflow
+import mlflow.sklearn
+
+from .dataio import load_data
+from .features import (
+    load_feature_spec,
+    resolve_feature_columns,
+    select_features,
+    feature_manifest,
+)
+from .model_zoo import build_pipeline, anomaly_scores
+from .metrics import topk_indices, score_summary
+
+
+def _zscore_baseline(Xdf: pd.DataFrame) -> np.ndarray:
+    """Composite z baseline: per-row max absolute z over columns."""
+    mu = Xdf.mean(axis=0)
+    sd = Xdf.std(axis=0).replace(0, 1e-8)
+    z = (Xdf - mu) / sd
+    return z.abs().max(axis=1).to_numpy()
+
+
+def main():
+    ap = argparse.ArgumentParser(description="AAA unsupervised experiment runner (MLflow)")
+    ap.add_argument("--data", required=True, help="file/folder/glob path to data")
+    ap.add_argument("--features", required=True, help="features YAML (grouped schema)")
+    ap.add_argument("--config", required=True, help="experiment YAML (algo + params)")
+    ap.add_argument("--id-cols", default=None, help="comma list of ID cols to carry (overrides YAML id_columns)")
+    ap.add_argument("--feature-mode", choices=["all", "groups", "list"], default="all")
+    ap.add_argument("--feature-groups", default=None, help="comma list when mode=groups (e.g., SC,SS)")
+    ap.add_argument("--feature-list", default=None, help="comma list when mode=list")
+    ap.add_argument("--limit", type=int, default=None, help="row cap for quick runs")
+    ap.add_argument("--topk", type=int, default=200)
+    ap.add_argument("--mlflow-uri", default="sqlite:///mlflow.db")
+    args = ap.parse_args()
+
+    # Ensure artifact dirs
+    os.makedirs("artifacts/reports", exist_ok=True)
+    os.makedirs("artifacts/logs", exist_ok=True)
+
+    # Load experiment config (algo + params)
+    with open(args.config, "r") as f:
+        cfg = yaml.safe_load(f)
+    algo = cfg["algo"].lower()
+    params = cfg.get("params", {})
+
+    # Load feature spec + resolve columns
+    spec = load_feature_spec(args.features)  # expects keys: id, id_columns, feature_groups/feature_all etc.
+    if args.id_cols:
+        id_cols = [c.strip() for c in args.id_cols.split(",") if c.strip()]
+    else:
+        id_cols = list(spec.get("id_columns", []))  # match your YAML key
+
+    groups = [g.strip() for g in args.feature_groups.split(",")] if args.feature_groups else None
+    explicit = [c.strip() for c in args.feature_list.split(",")] if args.feature_list else None
+    cols = resolve_feature_columns(spec, mode=args.feature_mode, groups=groups, extra=explicit)
+
+    # Load data
+    t0 = time.time()
+    raw = load_data(args.data, limit=args.limit)
+    load_s = time.time() - t0
+
+    # ID frame
+    id_frame = pd.DataFrame()
+    for c in id_cols:
+        if c in raw.columns:
+            id_frame[c] = raw[c]
+    if id_frame.empty:
+        id_frame["row_id"] = np.arange(len(raw))
+
+    # Select/clean features
+    Xdf = select_features(raw, cols)
+    manifest = feature_manifest(list(Xdf.columns))
+
+    # Build pipeline (and know if we need fit_predict)
+    pipe, needs_fit_predict = build_pipeline(algo, params)
+
+    # ---------- MLflow setup ----------
+    mlflow.set_tracking_uri(args.mlflow_uri)
+    mlflow.set_experiment(f"AAA-Unsupervised/{spec['id']}/{algo}")
+
+    # readable run name + config/feature tags + stable config hash
+    config_name   = os.path.basename(args.config)
+    features_name = os.path.basename(args.features)
+    cfg_text = yaml.safe_dump(cfg, sort_keys=True)
+    cfg_hash = hashlib.md5(cfg_text.encode("utf-8")).hexdigest()
+
+    def _short(v):  # compact string for run names/tags
+        return str(v).replace(" ", "")
+
+    variant = (
+        f"ne{_short(params.get('n_estimators', '?'))}"
+        f"_ms{_short(params.get('max_samples', 'auto'))}"
+        f"_mf{_short(params.get('max_features', 1.0))}"
+        f"_cont{_short(params.get('contamination', 'auto'))}"
+    )
+    run_name = f"{algo}-{spec['id']}:{config_name.replace('.yaml','')}:{variant}"
+
+    with mlflow.start_run(run_name=run_name):
+        # Tags: easy filtering in UI
+        mlflow.set_tag("feature_set",   spec["id"])
+        mlflow.set_tag("algo",          algo)
+        mlflow.set_tag("variant",       variant)
+        mlflow.set_tag("config_file",   args.config)
+        mlflow.set_tag("config_name",   config_name)
+        mlflow.set_tag("config_hash",   cfg_hash)
+        mlflow.set_tag("features_file", args.features)
+        mlflow.set_tag("features_name", features_name)
+        mlflow.set_tag("data_glob",     args.data)
+        # optional git SHA
+        try:
+            sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+            mlflow.set_tag("git_sha", sha)
+        except Exception:
+            pass
+
+        # Persist exact inputs as artifacts
+        mlflow.log_text(cfg_text, f"configs/{config_name}")   # normalized YAML content used
+        mlflow.log_artifact(args.config)                      # original config file
+        mlflow.log_artifact(args.features)                    # feature YAML
+
+        # Params (keep together, including topk)
+        mlflow.log_params({
+            "algo": algo,
+            "feature_set": spec["id"],
+            "feature_mode": args.feature_mode,
+            "feature_groups": ",".join(groups) if groups else "",
+            "n_features": int(manifest["n_features"]),
+            "topk": int(args.topk),
+            **params,
+        })
+        mlflow.log_dict(manifest, f"reports/feature_manifest_{spec['id']}.json")
+
+        # Fit
+        t1 = time.time()
+        X = Xdf.to_numpy()
+        if needs_fit_predict:
+            _ = pipe.fit_predict(X)
+        else:
+            pipe.fit(X)
+        fit_s = time.time() - t1
+
+        # Log & register model ONCE (creates a version in the registry)
+        mlflow.sklearn.log_model(
+            sk_model=pipe,
+            artifact_path="model",
+            registered_model_name=f"{algo}_{spec['id']}"
+        )
+
+        # Score
+        scores = anomaly_scores(algo, pipe, X)
+        summ = score_summary(scores)
+
+        for k, v in {
+            "fit_time_s": float(fit_s),
+            "rows": int(X.shape[0]),
+            "score_min": float(summ["min"]),
+            "score_max": float(summ["max"]),
+            "score_mean": float(summ["mean"]),
+            "score_var": float(summ["var"]),
+            "load_time_s": float(load_s),
+        }.items():
+            mlflow.log_metric(k, v, step=0)
+
+        # Baseline overlap vs zscore@K
+        zscores = _zscore_baseline(Xdf)
+        K = int(args.topk)
+        a_idx = topk_indices(scores, K)
+        z_idx = topk_indices(zscores, K)
+        overlap = len(set(a_idx.tolist()) & set(z_idx.tolist())) / float(max(1, K))
+        mlflow.log_metric("overlap_vs_zscore_at_K", float(overlap), step=0)
+
+        # Export Top-K CSV
+        top_df = id_frame.iloc[a_idx].copy()
+        top_df["score"] = scores[a_idx]
+        top_path = f"artifacts/reports/topk_{algo}_{spec['id']}.csv"
+        top_df.to_csv(top_path, index=False)
+        mlflow.log_artifact(top_path)
+
+        # Score histogram CSV
+        hist_counts, hist_edges = np.histogram(scores, bins=30)
+        hist_path = f"artifacts/reports/score_hist_{algo}_{spec['id']}.csv"
+        with open(hist_path, "w") as f:
+            f.write("bin_left,bin_right,count\n")
+            for i in range(len(hist_counts)):
+                f.write(f"{hist_edges[i]},{hist_edges[i+1]},{int(hist_counts[i])}\n")
+        mlflow.log_artifact(hist_path)
+
+        # Run meta (handy for quick snapshot)
+        meta = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "algo": algo,
+            "feature_set": spec["id"],
+            "n_features": int(manifest["n_features"]),
+            "rows": int(X.shape[0]),
+            "fit_time_s": float(fit_s),
+            "topk": int(K),
+            "overlap_vs_zscore_at_K": float(overlap),
+            "data_path": args.data,
+            "features_yaml": args.features,
+            "config_yaml": args.config,
+            "variant": variant,
+            "config_hash": cfg_hash,
+        }
+        with open("artifacts/logs/run_meta.json", "w") as f:
+            json.dump(meta, f, indent=2)
+        mlflow.log_artifact("artifacts/logs/run_meta.json")
+
+    print(
+        f"Run complete: algo={algo}, fs={spec['id']}, n={len(Xdf)} rows, "
+        f"fit_time={fit_s:.2f}s. Top-K → {top_path}"
+    )
+
+
+if __name__ == "__main__":
+    main()
+    
+#....
+from __future__ import annotations
+import sys, subprocess, itertools, os, argparse
+from typing import Iterable, List, Tuple, Any
+
+# Default paths (can override via CLI)
+DEFAULT_DATA     = "data_stream/processed/date_2024-*/part.parquet"
+DEFAULT_FEATURES = "configs/features/fs_v1.yaml"
+
+# Default grid (edit or override via CLI if you want)
+DEFAULT_N_ESTIMATORS = [300, 500]
+DEFAULT_MAX_SAMPLES  = [256, 512, 1024]     # per-tree subsample size
+DEFAULT_MAX_FEATURES = [0.5, 0.7, 1.0]      # fraction of features per split
+DEFAULT_CONTAM       = ["auto", 0.01]       # thresholding behavior
+
+
+def _str_for_path(v: Any) -> str:
+    """
+    Make a short, filename-safe token for a value.
+    Examples: 0.01 -> '0p01', 'auto' -> 'auto'
+    """
+    s = str(v)
+    s = s.replace(".", "p").replace(" ", "")
+    return s
+
+
+def _gen_cfg_text(ne: int, ms: int, mf: float, cont: Any) -> str:
+    """
+    Build a minimal experiment YAML for run_experiment.py (isolation_forest).
+    Quote 'auto' to be explicit in YAML; numbers are emitted as-is.
+    """
+    cont_str = f"'{cont}'" if isinstance(cont, str) else cont
+    return f"""algo: isolation_forest
+params:
+  n_estimators: {ne}
+  max_samples: {ms}
+  max_features: {mf}
+  contamination: {cont_str}
+  bootstrap: false
+  n_jobs: -1
+  random_state: 42
+"""
+
+
+def _write_cfg(ne: int, ms: int, mf: float, cont: Any) -> str:
+    os.makedirs("configs/experiments/_generated", exist_ok=True)
+    fname = (
+        f"iforest_ne{_str_for_path(ne)}"
+        f"_ms{_str_for_path(ms)}"
+        f"_mf{_str_for_path(mf)}"
+        f"_cont{_str_for_path(cont)}.yaml"
+    )
+    path = os.path.join("configs/experiments/_generated", fname)
+    with open(path, "w") as f:
+        f.write(_gen_cfg_text(ne, ms, mf, cont))
+    return path
+
+
+def sh(cmd: List[str]) -> None:
+    print(">>", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Sweep IsolationForest params and launch run_experiment for each combo."
+    )
+    ap.add_argument("--data", default=DEFAULT_DATA, help="Data glob/path passed to run_experiment.py")
+    ap.add_argument("--features", default=DEFAULT_FEATURES, help="Features YAML for all runs")
+    ap.add_argument("--topk", type=int, default=100, help="Top-K for overlap metric")
+    ap.add_argument("--limit", type=int, default=None, help="Row cap (passed through), optional")
+    ap.add_argument("--mlflow-uri", default=None, help="Override MLflow tracking URI for all runs (optional)")
+    ap.add_argument("--dry-run", action="store_true", help="Only generate YAMLs, don’t launch runs")
+    # Optional: narrow the grid from the CLI
+    ap.add_argument("--n-estimators", nargs="*", type=int, default=DEFAULT_N_ESTIMATORS)
+    ap.add_argument("--max-samples",  nargs="*", type=int, default=DEFAULT_MAX_SAMPLES)
+    ap.add_argument("--max-features", nargs="*", type=float, default=DEFAULT_MAX_FEATURES)
+    ap.add_argument("--contam",       nargs="*", default=DEFAULT_CONTAM)
+    return ap.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Compose the base command (we’ll append --config per run)
+    base_args = [
+        sys.executable, "-m", "src.aaa.exp.run_experiment",
+        "--data", args.data,
+        "--features", args.features,
+        "--topk", str(args.topk),
+    ]
+    if args.limit is not None:
+        base_args += ["--limit", str(args.limit)]
+    if args.mlflow_uri:
+        base_args += ["--mlflow-uri", args.mlflow_uri]
+
+    # Cartesian product over the grid
+    combos: Iterable[Tuple[int, int, float, Any]] = itertools.product(
+        args.n_estimators, args.max_samples, args.max_features, args.contam
+    )
+
+    # Generate configurations and (optionally) run
+    generated_paths: List[str] = []
+    for ne, ms, mf, cont in combos:
+        cfg_path = _write_cfg(ne, ms, mf, cont)
+        generated_paths.append(cfg_path)
+        if args.dry_run:
+            print(f"[DRY-RUN] Generated: {cfg_path}")
+            continue
+
+        try:
+            sh(base_args + ["--config", cfg_path])
+        except subprocess.CalledProcessError as e:
+            # Keep sweeping even if one run fails
+            print(f"[WARN] Run failed for {cfg_path} (exit {e.returncode}). Continuing...", flush=True)
+            continue
+
+    if args.dry_run:
+        print(f"\nGenerated {len(generated_paths)} YAMLs under configs/experiments/_generated/")
+    else:
+        print("\nSweep complete.")
+
+
+if __name__ == "__main__":
+    main()
+
+#====
+#algo: isolation_forest
 params:
   n_estimators: 200
   max_samples: auto
