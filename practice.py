@@ -1,3 +1,100 @@
+algo: isolation_forest
+params:
+  n_estimators: 200
+  max_samples: auto
+  max_features: 1.0
+  contamination: auto
+  bootstrap: false
+  n_jobs: -1
+  random_state: 42
+
+algo: isolation_forest
+params:
+  n_estimators: 500
+  max_samples: auto
+  max_features: 1.0
+  contamination: auto
+  bootstrap: false
+  n_jobs: -1
+  random_state: 42
+
+algo: isolation_forest
+params:
+  n_estimators: 400
+  max_samples: 512
+  max_features: 1.0
+  contamination: auto
+  bootstrap: false
+  n_jobs: -1
+  random_state: 42
+
+algo: isolation_forest
+params:
+  n_estimators: 400
+  max_samples: auto
+  max_features: 0.7
+  contamination: auto
+  bootstrap: false
+  n_jobs: -1
+  random_state: 42
+
+algo: isolation_forest
+params:
+  n_estimators: 400
+  max_samples: auto
+  max_features: 1.0
+  contamination: 0.01
+  bootstrap: false
+  n_jobs: -1
+  random_state: 42
+
+from __future__ import annotations
+import sys, subprocess
+
+DATA = "data_stream/processed/date_2024-01-*/part.parquet"
+FEATURES = "configs/features/fs_v1.yaml"
+CONFIGS = [
+    "configs/experiments/iforest/base.yaml",
+    "configs/experiments/iforest/wide.yaml",
+    "configs/experiments/iforest/low_subsample.yaml",
+    "configs/experiments/iforest/feat_sub70.yaml",
+    "configs/experiments/iforest/cont_1pct.yaml",
+]
+
+def sh(cmd: list[str]):
+    print(">>", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+def main():
+    for cfg in CONFIGS:
+        sh([
+            sys.executable, "-m", "src.aaa.exp.run_experiment",
+            "--data", DATA,
+            "--features", FEATURES,
+            "--config", cfg,
+            "--topk", "100"
+        ])
+
+if __name__ == "__main__":
+    main()
+    
+#...........
+
+import subprocess
+
+# git hash for reproducibility (ignore failure if not a git repo)
+try:
+    git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+    mlflow.set_tag("git_sha", git_sha)
+except Exception:
+    pass
+
+mlflow.set_tag("sweep_group", "iforest_v1")   # lets you filter all runs from this sweep
+
+
+export MLFLOW_TRACKING_URI=sqlite:///$(pwd)/mlflow.db
+python -m src.aaa.exp.run_iforest_sweep
+#==================
 from __future__ import annotations
 import argparse, os, json
 from datetime import datetime, timezone
