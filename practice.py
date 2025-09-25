@@ -1,3 +1,112 @@
+#==========run_lof_sweep.py==============
+from __future__ import annotations
+import sys, subprocess, os, argparse, itertools
+from typing import Any, Iterable, List, Tuple
+
+# Defaults (override via CLI if needed)
+DEFAULT_DATA     = "data_stream/processed/date_2024-01-*/part.parquet"
+DEFAULT_FEATURES = "configs/features/fs_v1.yaml"
+
+# ---- LOF grid (balanced, practical) ----
+# n_neighbors: core sensitivity; too small = noisy, too large = washed out
+DEFAULT_N_NEIGHBORS = [20, 50, 100]
+# leaf_size: tree index tuning (affects memory/speed)
+DEFAULT_LEAF_SIZE   = [30, 50]
+# metric: minkowski with p∈{1,2} (Manhattan/Euclidean) covers most use cases
+DEFAULT_P_VALUES    = [1, 2]
+# algorithm: let sklearn choose or force tree-based indexes
+DEFAULT_ALGOS       = ["auto", "ball_tree", "kd_tree"]
+# NOTE: `contamination` is not used by LOF (unsupervised mode); we rely on raw scores.
+
+def _s(v: Any) -> str:
+    """Compact token for filenames (e.g., 0.01 -> 0p01)."""
+    return str(v).replace(".", "p").replace(" ", "")
+
+def _gen_cfg_text(k: int, leaf: int, p: int, algo: str) -> str:
+    # LOF in sklearn computes negative_outlier_factor_ during fit_predict.
+    # We let your model_zoo handle scaling; if you want built-in scaling, add a scaler in model_zoo.
+    return f"""algo: lof
+params:
+  n_neighbors: {k}
+  leaf_size: {leaf}
+  metric: minkowski
+  p: {p}
+  algorithm: {algo}
+  n_jobs: -1
+  novelty: false
+"""
+
+def _write_cfg(k: int, leaf: int, p: int, algo: str) -> str:
+    os.makedirs("configs/experiments/_lof_generated", exist_ok=True)
+    fname = f"lof_k{_s(k)}_leaf{_s(leaf)}_p{_s(p)}_algo{_s(algo)}.yaml"
+    path = os.path.join("configs/experiments/_lof_generated", fname)
+    with open(path, "w") as f:
+        f.write(_gen_cfg_text(k, leaf, p, algo))
+    return path
+
+def sh(cmd: List[str]) -> None:
+    print(">>", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Sweep Local Outlier Factor (LOF) params and launch run_experiment for each combo."
+    )
+    ap.add_argument("--data", default=DEFAULT_DATA, help="Data glob/path for run_experiment.py")
+    ap.add_argument("--features", default=DEFAULT_FEATURES, help="Features YAML for all runs")
+    ap.add_argument("--topk", type=int, default=100, help="Top-K for overlap metric")
+    ap.add_argument("--limit", type=int, default=200000, help="Row cap per run (LOF is heavy, default 200k)")
+    ap.add_argument("--mlflow-uri", default=None, help="Override MLflow tracking URI for all runs (optional)")
+    ap.add_argument("--dry-run", action="store_true", help="Only generate YAMLs; don’t launch runs")
+
+    # Optional: narrow/override the grid via CLI
+    ap.add_argument("--n-neighbors", nargs="*", type=int, default=DEFAULT_N_NEIGHBORS)
+    ap.add_argument("--leaf-size",   nargs="*", type=int, default=DEFAULT_LEAF_SIZE)
+    ap.add_argument("--p",           nargs="*", type=int, default=DEFAULT_P_VALUES)
+    ap.add_argument("--algos",       nargs="*", default=DEFAULT_ALGOS)
+    return ap.parse_args()
+
+def main():
+    args = parse_args()
+
+    base_cmd = [
+        sys.executable, "-m", "src.aaa.exp.run_experiment",
+        "--data", args.data,
+        "--features", args.features,
+        "--topk", str(args.topk),
+    ]
+    if args.limit is not None:
+        base_cmd += ["--limit", str(args.limit)]
+    if args.mlflow_uri:
+        base_cmd += ["--mlflow-uri", args.mlflow_uri]
+
+    combos: Iterable[Tuple[int, int, int, str]] = itertools.product(
+        args.n_neighbors, args.leaf_size, args.p, args.algos
+    )
+
+    generated: List[str] = []
+    for k, leaf, p, algo in combos:
+        cfg_path = _write_cfg(k, leaf, p, algo)
+        generated.append(cfg_path)
+
+        if args.dry_run:
+            print(f"[DRY-RUN] Generated: {cfg_path}")
+            continue
+
+        try:
+            sh(base_cmd + ["--config", cfg_path])
+        except subprocess.CalledProcessError as e:
+            print(f"[WARN] Run failed for {cfg_path} (exit {e.returncode}). Continuing...", flush=True)
+            continue
+
+    if args.dry_run:
+        print(f"\nGenerated {len(generated)} YAMLs under configs/experiments/_lof_generated/")
+    else:
+        print("\nLOF sweep complete.")
+
+if __name__ == "__main__":
+    main()
+#==========run_iforest_sweep.py=========
 from __future__ import annotations
 import os, json, time, argparse, yaml, hashlib, subprocess
 from datetime import datetime, timezone
