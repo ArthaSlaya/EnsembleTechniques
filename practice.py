@@ -1,1490 +1,382 @@
-#==========run_lof_sweep.py==============
-from __future__ import annotations
-import sys, subprocess, os, argparse, itertools
-from typing import Any, Iterable, List, Tuple
-
-# Defaults (override via CLI if needed)
-DEFAULT_DATA     = "data_stream/processed/date_2024-01-*/part.parquet"
-DEFAULT_FEATURES = "configs/features/fs_v1.yaml"
-
-# ---- LOF grid (balanced, practical) ----
-# n_neighbors: core sensitivity; too small = noisy, too large = washed out
-DEFAULT_N_NEIGHBORS = [20, 50, 100]
-# leaf_size: tree index tuning (affects memory/speed)
-DEFAULT_LEAF_SIZE   = [30, 50]
-# metric: minkowski with p∈{1,2} (Manhattan/Euclidean) covers most use cases
-DEFAULT_P_VALUES    = [1, 2]
-# algorithm: let sklearn choose or force tree-based indexes
-DEFAULT_ALGOS       = ["auto", "ball_tree", "kd_tree"]
-# NOTE: `contamination` is not used by LOF (unsupervised mode); we rely on raw scores.
-
-def _s(v: Any) -> str:
-    """Compact token for filenames (e.g., 0.01 -> 0p01)."""
-    return str(v).replace(".", "p").replace(" ", "")
-
-def _gen_cfg_text(k: int, leaf: int, p: int, algo: str) -> str:
-    # LOF in sklearn computes negative_outlier_factor_ during fit_predict.
-    # We let your model_zoo handle scaling; if you want built-in scaling, add a scaler in model_zoo.
-    return f"""algo: lof
-params:
-  n_neighbors: {k}
-  leaf_size: {leaf}
-  metric: minkowski
-  p: {p}
-  algorithm: {algo}
-  n_jobs: -1
-  novelty: false
-"""
-
-def _write_cfg(k: int, leaf: int, p: int, algo: str) -> str:
-    os.makedirs("configs/experiments/_lof_generated", exist_ok=True)
-    fname = f"lof_k{_s(k)}_leaf{_s(leaf)}_p{_s(p)}_algo{_s(algo)}.yaml"
-    path = os.path.join("configs/experiments/_lof_generated", fname)
-    with open(path, "w") as f:
-        f.write(_gen_cfg_text(k, leaf, p, algo))
-    return path
-
-def sh(cmd: List[str]) -> None:
-    print(">>", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
-
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description="Sweep Local Outlier Factor (LOF) params and launch run_experiment for each combo."
-    )
-    ap.add_argument("--data", default=DEFAULT_DATA, help="Data glob/path for run_experiment.py")
-    ap.add_argument("--features", default=DEFAULT_FEATURES, help="Features YAML for all runs")
-    ap.add_argument("--topk", type=int, default=100, help="Top-K for overlap metric")
-    ap.add_argument("--limit", type=int, default=200000, help="Row cap per run (LOF is heavy, default 200k)")
-    ap.add_argument("--mlflow-uri", default=None, help="Override MLflow tracking URI for all runs (optional)")
-    ap.add_argument("--dry-run", action="store_true", help="Only generate YAMLs; don’t launch runs")
-
-    # Optional: narrow/override the grid via CLI
-    ap.add_argument("--n-neighbors", nargs="*", type=int, default=DEFAULT_N_NEIGHBORS)
-    ap.add_argument("--leaf-size",   nargs="*", type=int, default=DEFAULT_LEAF_SIZE)
-    ap.add_argument("--p",           nargs="*", type=int, default=DEFAULT_P_VALUES)
-    ap.add_argument("--algos",       nargs="*", default=DEFAULT_ALGOS)
-    return ap.parse_args()
-
-def main():
-    args = parse_args()
-
-    base_cmd = [
-        sys.executable, "-m", "src.aaa.exp.run_experiment",
-        "--data", args.data,
-        "--features", args.features,
-        "--topk", str(args.topk),
-    ]
-    if args.limit is not None:
-        base_cmd += ["--limit", str(args.limit)]
-    if args.mlflow_uri:
-        base_cmd += ["--mlflow-uri", args.mlflow_uri]
-
-    combos: Iterable[Tuple[int, int, int, str]] = itertools.product(
-        args.n_neighbors, args.leaf_size, args.p, args.algos
-    )
-
-    generated: List[str] = []
-    for k, leaf, p, algo in combos:
-        cfg_path = _write_cfg(k, leaf, p, algo)
-        generated.append(cfg_path)
-
-        if args.dry_run:
-            print(f"[DRY-RUN] Generated: {cfg_path}")
-            continue
-
-        try:
-            sh(base_cmd + ["--config", cfg_path])
-        except subprocess.CalledProcessError as e:
-            print(f"[WARN] Run failed for {cfg_path} (exit {e.returncode}). Continuing...", flush=True)
-            continue
-
-    if args.dry_run:
-        print(f"\nGenerated {len(generated)} YAMLs under configs/experiments/_lof_generated/")
-    else:
-        print("\nLOF sweep complete.")
-
-if __name__ == "__main__":
-    main()
-#==========run_iforest_sweep.py=========
-from __future__ import annotations
-import os, json, time, argparse, yaml, hashlib, subprocess
-from datetime import datetime, timezone
-import numpy as np
-import pandas as pd
-import mlflow
-import mlflow.sklearn
-
-from .dataio import load_data
-from .features import (
-    load_feature_spec,
-    resolve_feature_columns,
-    select_features,
-    feature_manifest,
-)
-from .model_zoo import build_pipeline, anomaly_scores
-from .metrics import topk_indices, score_summary
-
-
-def _zscore_baseline(Xdf: pd.DataFrame) -> np.ndarray:
-    """Composite z baseline: per-row max absolute z over columns."""
-    mu = Xdf.mean(axis=0)
-    sd = Xdf.std(axis=0).replace(0, 1e-8)
-    z = (Xdf - mu) / sd
-    return z.abs().max(axis=1).to_numpy()
-
-
-def main():
-    ap = argparse.ArgumentParser(description="AAA unsupervised experiment runner (MLflow)")
-    ap.add_argument("--data", required=True, help="file/folder/glob path to data")
-    ap.add_argument("--features", required=True, help="features YAML (grouped schema)")
-    ap.add_argument("--config", required=True, help="experiment YAML (algo + params)")
-    ap.add_argument("--id-cols", default=None, help="comma list of ID cols to carry (overrides YAML id_columns)")
-    ap.add_argument("--feature-mode", choices=["all", "groups", "list"], default="all")
-    ap.add_argument("--feature-groups", default=None, help="comma list when mode=groups (e.g., SC,SS)")
-    ap.add_argument("--feature-list", default=None, help="comma list when mode=list")
-    ap.add_argument("--limit", type=int, default=None, help="row cap for quick runs")
-    ap.add_argument("--topk", type=int, default=200)
-    ap.add_argument("--mlflow-uri", default="sqlite:///mlflow.db")
-    args = ap.parse_args()
-
-    # Ensure artifact dirs
-    os.makedirs("artifacts/reports", exist_ok=True)
-    os.makedirs("artifacts/logs", exist_ok=True)
-
-    # Load experiment config (algo + params)
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
-    algo = cfg["algo"].lower()
-    params = cfg.get("params", {})
-
-    # Load feature spec + resolve columns
-    spec = load_feature_spec(args.features)  # expects keys: id, id_columns, feature_groups/feature_all etc.
-    if args.id_cols:
-        id_cols = [c.strip() for c in args.id_cols.split(",") if c.strip()]
-    else:
-        id_cols = list(spec.get("id_columns", []))  # match your YAML key
-
-    groups = [g.strip() for g in args.feature_groups.split(",")] if args.feature_groups else None
-    explicit = [c.strip() for c in args.feature_list.split(",")] if args.feature_list else None
-    cols = resolve_feature_columns(spec, mode=args.feature_mode, groups=groups, extra=explicit)
-
-    # Load data
-    t0 = time.time()
-    raw = load_data(args.data, limit=args.limit)
-    load_s = time.time() - t0
-
-    # ID frame
-    id_frame = pd.DataFrame()
-    for c in id_cols:
-        if c in raw.columns:
-            id_frame[c] = raw[c]
-    if id_frame.empty:
-        id_frame["row_id"] = np.arange(len(raw))
-
-    # Select/clean features
-    Xdf = select_features(raw, cols)
-    manifest = feature_manifest(list(Xdf.columns))
-
-    # Build pipeline (and know if we need fit_predict)
-    pipe, needs_fit_predict = build_pipeline(algo, params)
-
-    # ---------- MLflow setup ----------
-    mlflow.set_tracking_uri(args.mlflow_uri)
-    mlflow.set_experiment(f"AAA-Unsupervised/{spec['id']}/{algo}")
-
-    # readable run name + config/feature tags + stable config hash
-    config_name   = os.path.basename(args.config)
-    features_name = os.path.basename(args.features)
-    cfg_text = yaml.safe_dump(cfg, sort_keys=True)
-    cfg_hash = hashlib.md5(cfg_text.encode("utf-8")).hexdigest()
-
-    def _short(v):  # compact string for run names/tags
-        return str(v).replace(" ", "")
-
-    variant = (
-        f"ne{_short(params.get('n_estimators', '?'))}"
-        f"_ms{_short(params.get('max_samples', 'auto'))}"
-        f"_mf{_short(params.get('max_features', 1.0))}"
-        f"_cont{_short(params.get('contamination', 'auto'))}"
-    )
-    run_name = f"{algo}-{spec['id']}:{config_name.replace('.yaml','')}:{variant}"
-
-    with mlflow.start_run(run_name=run_name):
-        # Tags: easy filtering in UI
-        mlflow.set_tag("feature_set",   spec["id"])
-        mlflow.set_tag("algo",          algo)
-        mlflow.set_tag("variant",       variant)
-        mlflow.set_tag("config_file",   args.config)
-        mlflow.set_tag("config_name",   config_name)
-        mlflow.set_tag("config_hash",   cfg_hash)
-        mlflow.set_tag("features_file", args.features)
-        mlflow.set_tag("features_name", features_name)
-        mlflow.set_tag("data_glob",     args.data)
-        # optional git SHA
-        try:
-            sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-            mlflow.set_tag("git_sha", sha)
-        except Exception:
-            pass
-
-        # Persist exact inputs as artifacts
-        mlflow.log_text(cfg_text, f"configs/{config_name}")   # normalized YAML content used
-        mlflow.log_artifact(args.config)                      # original config file
-        mlflow.log_artifact(args.features)                    # feature YAML
-
-        # Params (keep together, including topk)
-        mlflow.log_params({
-            "algo": algo,
-            "feature_set": spec["id"],
-            "feature_mode": args.feature_mode,
-            "feature_groups": ",".join(groups) if groups else "",
-            "n_features": int(manifest["n_features"]),
-            "topk": int(args.topk),
-            **params,
-        })
-        mlflow.log_dict(manifest, f"reports/feature_manifest_{spec['id']}.json")
-
-        # Fit
-        t1 = time.time()
-        X = Xdf.to_numpy()
-        if needs_fit_predict:
-            _ = pipe.fit_predict(X)
-        else:
-            pipe.fit(X)
-        fit_s = time.time() - t1
-
-        # Log & register model ONCE (creates a version in the registry)
-        mlflow.sklearn.log_model(
-            sk_model=pipe,
-            artifact_path="model",
-            registered_model_name=f"{algo}_{spec['id']}"
-        )
-
-        # Score
-        scores = anomaly_scores(algo, pipe, X)
-        summ = score_summary(scores)
-
-        for k, v in {
-            "fit_time_s": float(fit_s),
-            "rows": int(X.shape[0]),
-            "score_min": float(summ["min"]),
-            "score_max": float(summ["max"]),
-            "score_mean": float(summ["mean"]),
-            "score_var": float(summ["var"]),
-            "load_time_s": float(load_s),
-        }.items():
-            mlflow.log_metric(k, v, step=0)
-
-        # Baseline overlap vs zscore@K
-        zscores = _zscore_baseline(Xdf)
-        K = int(args.topk)
-        a_idx = topk_indices(scores, K)
-        z_idx = topk_indices(zscores, K)
-        overlap = len(set(a_idx.tolist()) & set(z_idx.tolist())) / float(max(1, K))
-        mlflow.log_metric("overlap_vs_zscore_at_K", float(overlap), step=0)
-
-        # Export Top-K CSV
-        top_df = id_frame.iloc[a_idx].copy()
-        top_df["score"] = scores[a_idx]
-        top_path = f"artifacts/reports/topk_{algo}_{spec['id']}.csv"
-        top_df.to_csv(top_path, index=False)
-        mlflow.log_artifact(top_path)
-
-        # Score histogram CSV
-        hist_counts, hist_edges = np.histogram(scores, bins=30)
-        hist_path = f"artifacts/reports/score_hist_{algo}_{spec['id']}.csv"
-        with open(hist_path, "w") as f:
-            f.write("bin_left,bin_right,count\n")
-            for i in range(len(hist_counts)):
-                f.write(f"{hist_edges[i]},{hist_edges[i+1]},{int(hist_counts[i])}\n")
-        mlflow.log_artifact(hist_path)
-
-        # Run meta (handy for quick snapshot)
-        meta = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "algo": algo,
-            "feature_set": spec["id"],
-            "n_features": int(manifest["n_features"]),
-            "rows": int(X.shape[0]),
-            "fit_time_s": float(fit_s),
-            "topk": int(K),
-            "overlap_vs_zscore_at_K": float(overlap),
-            "data_path": args.data,
-            "features_yaml": args.features,
-            "config_yaml": args.config,
-            "variant": variant,
-            "config_hash": cfg_hash,
-        }
-        with open("artifacts/logs/run_meta.json", "w") as f:
-            json.dump(meta, f, indent=2)
-        mlflow.log_artifact("artifacts/logs/run_meta.json")
-
-    print(
-        f"Run complete: algo={algo}, fs={spec['id']}, n={len(Xdf)} rows, "
-        f"fit_time={fit_s:.2f}s. Top-K → {top_path}"
-    )
-
-
-if __name__ == "__main__":
-    main()
-    
-#....
-from __future__ import annotations
-import sys, subprocess, itertools, os, argparse
-from typing import Iterable, List, Tuple, Any
-
-# Default paths (can override via CLI)
-DEFAULT_DATA     = "data_stream/processed/date_2024-*/part.parquet"
-DEFAULT_FEATURES = "configs/features/fs_v1.yaml"
-
-# Default grid (edit or override via CLI if you want)
-DEFAULT_N_ESTIMATORS = [300, 500]
-DEFAULT_MAX_SAMPLES  = [256, 512, 1024]     # per-tree subsample size
-DEFAULT_MAX_FEATURES = [0.5, 0.7, 1.0]      # fraction of features per split
-DEFAULT_CONTAM       = ["auto", 0.01]       # thresholding behavior
-
-
-def _str_for_path(v: Any) -> str:
-    """
-    Make a short, filename-safe token for a value.
-    Examples: 0.01 -> '0p01', 'auto' -> 'auto'
-    """
-    s = str(v)
-    s = s.replace(".", "p").replace(" ", "")
-    return s
-
-
-def _gen_cfg_text(ne: int, ms: int, mf: float, cont: Any) -> str:
-    """
-    Build a minimal experiment YAML for run_experiment.py (isolation_forest).
-    Quote 'auto' to be explicit in YAML; numbers are emitted as-is.
-    """
-    cont_str = f"'{cont}'" if isinstance(cont, str) else cont
-    return f"""algo: isolation_forest
-params:
-  n_estimators: {ne}
-  max_samples: {ms}
-  max_features: {mf}
-  contamination: {cont_str}
-  bootstrap: false
-  n_jobs: -1
-  random_state: 42
-"""
-
-
-def _write_cfg(ne: int, ms: int, mf: float, cont: Any) -> str:
-    os.makedirs("configs/experiments/_generated", exist_ok=True)
-    fname = (
-        f"iforest_ne{_str_for_path(ne)}"
-        f"_ms{_str_for_path(ms)}"
-        f"_mf{_str_for_path(mf)}"
-        f"_cont{_str_for_path(cont)}.yaml"
-    )
-    path = os.path.join("configs/experiments/_generated", fname)
-    with open(path, "w") as f:
-        f.write(_gen_cfg_text(ne, ms, mf, cont))
-    return path
-
-
-def sh(cmd: List[str]) -> None:
-    print(">>", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
-
-
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description="Sweep IsolationForest params and launch run_experiment for each combo."
-    )
-    ap.add_argument("--data", default=DEFAULT_DATA, help="Data glob/path passed to run_experiment.py")
-    ap.add_argument("--features", default=DEFAULT_FEATURES, help="Features YAML for all runs")
-    ap.add_argument("--topk", type=int, default=100, help="Top-K for overlap metric")
-    ap.add_argument("--limit", type=int, default=None, help="Row cap (passed through), optional")
-    ap.add_argument("--mlflow-uri", default=None, help="Override MLflow tracking URI for all runs (optional)")
-    ap.add_argument("--dry-run", action="store_true", help="Only generate YAMLs, don’t launch runs")
-    # Optional: narrow the grid from the CLI
-    ap.add_argument("--n-estimators", nargs="*", type=int, default=DEFAULT_N_ESTIMATORS)
-    ap.add_argument("--max-samples",  nargs="*", type=int, default=DEFAULT_MAX_SAMPLES)
-    ap.add_argument("--max-features", nargs="*", type=float, default=DEFAULT_MAX_FEATURES)
-    ap.add_argument("--contam",       nargs="*", default=DEFAULT_CONTAM)
-    return ap.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    # Compose the base command (we’ll append --config per run)
-    base_args = [
-        sys.executable, "-m", "src.aaa.exp.run_experiment",
-        "--data", args.data,
-        "--features", args.features,
-        "--topk", str(args.topk),
-    ]
-    if args.limit is not None:
-        base_args += ["--limit", str(args.limit)]
-    if args.mlflow_uri:
-        base_args += ["--mlflow-uri", args.mlflow_uri]
-
-    # Cartesian product over the grid
-    combos: Iterable[Tuple[int, int, float, Any]] = itertools.product(
-        args.n_estimators, args.max_samples, args.max_features, args.contam
-    )
-
-    # Generate configurations and (optionally) run
-    generated_paths: List[str] = []
-    for ne, ms, mf, cont in combos:
-        cfg_path = _write_cfg(ne, ms, mf, cont)
-        generated_paths.append(cfg_path)
-        if args.dry_run:
-            print(f"[DRY-RUN] Generated: {cfg_path}")
-            continue
-
-        try:
-            sh(base_args + ["--config", cfg_path])
-        except subprocess.CalledProcessError as e:
-            # Keep sweeping even if one run fails
-            print(f"[WARN] Run failed for {cfg_path} (exit {e.returncode}). Continuing...", flush=True)
-            continue
-
-    if args.dry_run:
-        print(f"\nGenerated {len(generated_paths)} YAMLs under configs/experiments/_generated/")
-    else:
-        print("\nSweep complete.")
-
-
-if __name__ == "__main__":
-    main()
-
-#====
-#algo: isolation_forest
-params:
-  n_estimators: 200
-  max_samples: auto
-  max_features: 1.0
-  contamination: auto
-  bootstrap: false
-  n_jobs: -1
-  random_state: 42
-
-algo: isolation_forest
-params:
-  n_estimators: 500
-  max_samples: auto
-  max_features: 1.0
-  contamination: auto
-  bootstrap: false
-  n_jobs: -1
-  random_state: 42
-
-algo: isolation_forest
-params:
-  n_estimators: 400
-  max_samples: 512
-  max_features: 1.0
-  contamination: auto
-  bootstrap: false
-  n_jobs: -1
-  random_state: 42
-
-algo: isolation_forest
-params:
-  n_estimators: 400
-  max_samples: auto
-  max_features: 0.7
-  contamination: auto
-  bootstrap: false
-  n_jobs: -1
-  random_state: 42
-
-algo: isolation_forest
-params:
-  n_estimators: 400
-  max_samples: auto
-  max_features: 1.0
-  contamination: 0.01
-  bootstrap: false
-  n_jobs: -1
-  random_state: 42
-
-from __future__ import annotations
-import sys, subprocess
-
-DATA = "data_stream/processed/date_2024-01-*/part.parquet"
-FEATURES = "configs/features/fs_v1.yaml"
-CONFIGS = [
-    "configs/experiments/iforest/base.yaml",
-    "configs/experiments/iforest/wide.yaml",
-    "configs/experiments/iforest/low_subsample.yaml",
-    "configs/experiments/iforest/feat_sub70.yaml",
-    "configs/experiments/iforest/cont_1pct.yaml",
-]
-
-def sh(cmd: list[str]):
-    print(">>", " ".join(cmd))
-    subprocess.run(cmd, check=True)
-
-def main():
-    for cfg in CONFIGS:
-        sh([
-            sys.executable, "-m", "src.aaa.exp.run_experiment",
-            "--data", DATA,
-            "--features", FEATURES,
-            "--config", cfg,
-            "--topk", "100"
-        ])
-
-if __name__ == "__main__":
-    main()
-    
-#...........
-
-import subprocess
-
-# git hash for reproducibility (ignore failure if not a git repo)
-try:
-    git_sha = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
-    mlflow.set_tag("git_sha", git_sha)
-except Exception:
-    pass
-
-mlflow.set_tag("sweep_group", "iforest_v1")   # lets you filter all runs from this sweep
-
-
-export MLFLOW_TRACKING_URI=sqlite:///$(pwd)/mlflow.db
-python -m src.aaa.exp.run_iforest_sweep
-#==================
-from __future__ import annotations
-import argparse, os, json
-from datetime import datetime, timezone
-from src.aaa.exp.dataio import load_data
-
-def main():
-    ap = argparse.ArgumentParser(description="Diagnostic check for dataio module")
-    ap.add_argument("--data", required=True, help="file/folder/glob path")
-    ap.add_argument("--limit", type=int, default=5000)
-    args = ap.parse_args()
-
-    outdir = "artifacts/diagnostics/dataio"
-    os.makedirs(outdir, exist_ok=True)
-
-    df = load_data(args.data, limit=args.limit)
-
-    summary = {
-        "module": "dataio",
-        "status": "pass" if len(df) > 0 and df.shape[1] > 0 else "fail",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "inputs": {"path_arg": args.data, "limit": args.limit},
-        "resolved": {
-            "rows_loaded": int(len(df)),
-            "cols_loaded": int(df.shape[1]),
-            "columns_sample": df.columns.tolist()[:10],
-        },
-        "conditions": {
-            "rows_loaded_gt_0": len(df) > 0,
-            "cols_loaded_gt_0": df.shape[1] > 0,
-        },
-        "artifacts": {
-            "sample_csv": f"{outdir}/sample_head.csv",
-            "summary_json": f"{outdir}/summary.json",
-        },
-    }
-
-    df.head(20).to_csv(summary["artifacts"]["sample_csv"], index=False)
-    with open(summary["artifacts"]["summary_json"], "w") as f:
-        json.dump(summary, f, indent=2)
-
-    # Append to global audit log
-    with open("artifacts/diagnostics/audit_log.jsonl", "a") as audit_f:
-        audit_f.write(json.dumps(summary) + "\n")
-
-    print(f"[DataIO] {summary['status'].upper()}: {len(df)} rows, {df.shape[1]} cols")
-    print(f"Artifacts → {outdir}/")
-
-if __name__ == "__main__":
-    main()
-
-
-python -m src.aaa.diagnostics.dataio_check \
-  --data data_stream/processed/date_2024-01-*/part-*.parquet \
-  --limit 5000
-
-
-#===============================================
-
-mkdir -p src/aaa/exp
-mkdir -p src/aaa/diagnostics
-mkdir -p artifacts/diagnostics/features
-
-# package markers (ok if already present)
-touch src/__init__.py
-touch src/aaa/__init__.py
-touch src/aaa/exp/__init__.py
-touch src/aaa/diagnostics/__init__.py
-
-# module + diagnostic files
-touch src/aaa/exp/features.py
-touch src/aaa/diagnostics/features_check.py
-
-from __future__ import annotations
-import hashlib
-from typing import Dict, List, Optional
-import pandas as pd
-import yaml
-
-"""
-YAML structure supported:
-
-id: fs_v1
-i_columns:
-  - device_id
-  - date
-
-feature_groups:
-  SC:
-    - SC_session_count
-    - SC_expanding_mean
-  SS:
-    - SS_ShortSessionCounts
-    - SS_ShortSessionAnomaly
-
-feature_all:
-  - SC_session_count
-  - SS_ShortSessionCounts
-"""
-
-def load_feature_spec(path: str) -> Dict:
-    with open(path, "r") as f:
-        spec = yaml.safe_load(f) or {}
-    if "id" not in spec:
-        raise ValueError("Feature spec must include an 'id' field")
-    spec.setdefault("i_columns", [])
-    spec.setdefault("feature_groups", {})
-    spec.setdefault("feature_all", [])
-    return spec
-
-def resolve_feature_columns(
-    spec: Dict,
-    mode: str = "all",
-    groups: Optional[List[str]] = None,
-    extra: Optional[List[str]] = None,
-) -> List[str]:
-    """
-    mode:
-      - 'all'    -> use feature_all if present, else union of all groups
-      - 'groups' -> use only specified groups (list in `groups`)
-      - 'list'   -> use explicit list in `extra`
-    """
-    groups = groups or []
-    extra = extra or []
-    cols: List[str] = []
-
-    if mode == "all":
-        if spec.get("feature_all"):
-            cols = list(spec["feature_all"])  # preserve YAML order
-        else:
-            for _, glist in (spec.get("feature_groups") or {}).items():
-                cols.extend(glist)
-    elif mode == "groups":
-        if not groups:
-            raise ValueError("mode='groups' requires a non-empty groups list")
-        fg = spec.get("feature_groups") or {}
-        for g in groups:
-            if g not in fg:
-                raise KeyError(f"Group '{g}' not found in feature_groups")
-            cols.extend(fg[g])
-    elif mode == "list":
-        if not extra:
-            raise ValueError("mode='list' requires explicit 'extra' columns")
-        cols = list(extra)
-    else:
-        raise ValueError(f"Unknown feature resolution mode: {mode}")
-
-    # de-duplicate while preserving order
-    seen = set()
-    deduped = []
-    for c in cols:
-        if c not in seen:
-            seen.add(c)
-            deduped.append(c)
-    return deduped
-
-def select_features(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
-    missing = [c for c in columns if c not in df.columns]
-    if missing:
-        preview = ", ".join(missing[:8])
-        more = "..." if len(missing) > 8 else ""
-        raise KeyError(f"Missing columns in data: {preview}{more}")
-
-    sel = df[columns].copy()
-
-    # Coerce object→numeric where possible
-    for c in columns:
-        if sel[c].dtype == object:
-            sel[c] = pd.to_numeric(sel[c], errors="coerce")
-
-    # Simple numeric imputation for NaNs
-    sel = sel.fillna(sel.median(numeric_only=True))
-
-    # Drop any leftover non-numeric columns to keep models safe
-    non_numeric = sel.select_dtypes(exclude=["number"]).columns.tolist()
-    if non_numeric:
-        sel = sel.drop(columns=non_numeric)
-
-    return sel
-
-def feature_manifest(columns: List[str]) -> Dict:
-    ordered = list(columns)
-    joined = "|".join(ordered)
-    h = hashlib.sha1(joined.encode()).hexdigest()
-    return {"n_features": len(ordered), "feature_hash": h, "columns": ordered}
-    
-#................................
-from __future__ import annotations
-import argparse, os, json
-from datetime import datetime, timezone
-
-import pandas as pd
-
-from src.aaa.exp.dataio import load_data
-from src.aaa.exp.features import (
-    load_feature_spec,
-    resolve_feature_columns,
-    select_features,
-    feature_manifest,
-)
-
-def main():
-    ap = argparse.ArgumentParser(description="Diagnostic check for features module")
-    ap.add_argument("--data", required=True, help="file/folder/glob path")
-    ap.add_argument("--features", required=True, help="features YAML")
-    ap.add_argument("--feature-mode", choices=["all","groups","list"], default="all")
-    ap.add_argument("--feature-groups", default=None, help="comma list when mode=groups (e.g., SC,SS)")
-    ap.add_argument("--limit", type=int, default=5000)
-    args = ap.parse_args()
-
-    outdir = "artifacts/diagnostics/features"
-    os.makedirs(outdir, exist_ok=True)
-
-    # Load YAML
-    spec = load_feature_spec(args.features)
-    groups = [g.strip() for g in args.feature_groups.split(",")] if args.feature_groups else None
-    cols = resolve_feature_columns(spec, mode=args.feature_mode, groups=groups)
-
-    # Load data & select features
-    raw = load_data(args.data, limit=args.limit)
-    X = select_features(raw, cols)
-    manifest = feature_manifest(list(X.columns))
-
-    # Data quality checks
-    non_numeric_cols = X.select_dtypes(exclude=["number"]).columns.tolist()
-    nan_count = int(X.isna().sum().sum())  # after impute should be 0
-    status = "pass" if (manifest["n_features"] > 0 and not non_numeric_cols and nan_count == 0) else "fail"
-
-    # Write artifacts
-    sample_path = f"{outdir}/sample_features.csv"
-    desc_path   = f"{outdir}/describe.csv"
-    manifest_path = f"{outdir}/feature_manifest.json"
-    summary_path  = f"{outdir}/summary.json"
-
-    X.head(20).to_csv(sample_path, index=False)
-    X.describe().T.to_csv(desc_path)
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-
-    summary = {
-        "module": "features",
-        "status": status,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "inputs": {
-            "data": args.data,
-            "features_yaml": args.features,
-            "feature_mode": args.feature_mode,
-            "feature_groups": groups or [],
-            "limit": args.limit,
-        },
-        "selected": {
-            "feature_set_id": spec["id"],
-            "n_features": manifest["n_features"],
-            "feature_hash": manifest["feature_hash"],
-            "first_10": list(X.columns[:10]),
-            "rows": int(len(X)),
-        },
-        "data_quality": {
-            "nan_total_after_impute": nan_count,
-            "non_numeric_cols_after_clean": non_numeric_cols,
-        },
-        "pass_criteria": {
-            "n_features_gt_0": manifest["n_features"] > 0,
-            "no_nans_after_impute": nan_count == 0,
-            "all_numeric_after_clean": len(non_numeric_cols) == 0,
-        },
-        "artifacts": {
-            "sample_features_csv": sample_path,
-            "describe_csv": desc_path,
-            "feature_manifest_json": manifest_path,
-            "summary_json": summary_path,
-        },
-    }
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    # Append to global audit log
-    with open("artifacts/diagnostics/audit_log.jsonl", "a") as audit_f:
-        audit_f.write(json.dumps(summary) + "\n")
-
-    print(f"[Features] {status.upper()}: {manifest['n_features']} features, hash={manifest['feature_hash']}")
-    print(f"Artifacts → {outdir}/")
-
-if __name__ == "__main__":
-    main()
-
-#.................................
-# Phase-0 single-feature test
-python -m src.aaa.diagnostics.features_check \
-  --data data_stream/processed/date_2024-01-*/part-*.parquet \
-  --features configs/features/fs_test.yaml \
-  --feature-mode all \
-  --limit 5000
-
-
-#===============================================
-mkdir -p src/aaa/exp
-mkdir -p src/aaa/diagnostics
-mkdir -p artifacts/diagnostics/model
-
-touch src/__init__.py
-touch src/aaa/__init__.py
-touch src/aaa/exp/__init__.py
-touch src/aaa/diagnostics/__init__.py
-
-# new module + diagnostic
-touch src/aaa/exp/model_zoo.py
-touch src/aaa/diagnostics/model_zoo_check.py
-
-
-#................................
-
-# configs/experiments/iforest_cpu.yaml
-algo: isolation_forest
-
-params:
-  n_estimators: 200          # number of trees in the forest
-  max_samples: auto          # number of samples to draw for each base estimator
-  contamination: 0.05        # expected fraction of anomalies in data
-  max_features: 1.0          # fraction of features to draw for each tree
-  bootstrap: false           # whether bootstrap samples are used
-  n_jobs: -1                 # use all CPU cores
-  random_state: 42           # reproducibility
-#................................
-
-from __future__ import annotations
-from typing import Dict, Tuple
-import numpy as np
-
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import IsolationForest
-from sklearn.svm import OneClassSVM
-from sklearn.neighbors import LocalOutlierFactor
-
-
-def build_pipeline(algo: str, params: Dict) -> Tuple[Pipeline, bool]:
-    """
-    Returns (pipeline, needs_fit_predict)
-      - needs_fit_predict=True for LOF (since scores are computed during fit)
-    Conventions:
-      - We standardize features for LOF & OCSVM.
-      - Isolation Forest uses raw features.
-    """
-    a = algo.lower()
-
-    if a == "isolation_forest":
-        model = IsolationForest(**params)
-        pipe = Pipeline([("model", model)])
-        return pipe, False
-
-    if a == "ocsvm":
-        model = OneClassSVM(**params)
-        pipe = Pipeline([("scaler", StandardScaler()), ("model", model)])
-        return pipe, False
-
-    if a == "lof":
-        # Important: LOF uses fit_predict to compute negative_outlier_factor_
-        model = LocalOutlierFactor(**params)
-        pipe = Pipeline([("scaler", StandardScaler()), ("model", model)])
-        return pipe, True
-
-    raise ValueError(f"Unknown algo: {algo}")
-
-
-def anomaly_scores(algo: str, pipe: Pipeline, X: np.ndarray) -> np.ndarray:
-    """
-    Normalize direction so that HIGHER = more anomalous across all algos.
-      - IsolationForest: score_samples (higher = more normal) → negate.
-      - OCSVM: decision_function (positive = inliers) → negate.
-      - LOF: negative_outlier_factor_ (more negative = more outlier) → negate.
-    """
-    a = algo.lower()
-
-    if a == "isolation_forest":
-        raw = pipe["model"].score_samples(X)
-        return -raw
-
-    if a == "ocsvm":
-        raw = pipe["model"].decision_function(X)
-        return -raw
-
-    if a == "lof":
-        # requires fit_predict to have run; attribute on the model
-        raw = pipe["model"].negative_outlier_factor_
-        return -raw
-
-    raise ValueError(a)
-    
-#...........................
-
-from __future__ import annotations
-import argparse, os, json, yaml, numpy as np
-from datetime import datetime, timezone
-
-from src.aaa.exp.dataio import load_data
-from src.aaa.exp.features import load_feature_spec, resolve_feature_columns, select_features
-from src.aaa.exp.model_zoo import build_pipeline, anomaly_scores
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Diagnostic check for model_zoo module")
-    ap.add_argument("--data", required=True, help="file/folder/glob")
-    ap.add_argument("--features", required=True, help="features YAML (grouped schema)")
-    ap.add_argument("--config", required=True, help="experiment YAML (algo + params)")
-    ap.add_argument("--limit", type=int, default=3000)
-    ap.add_argument("--bins", type=int, default=30, help="histogram bins")
-    args = ap.parse_args()
-
-    outdir = "artifacts/diagnostics/model"
-    os.makedirs(outdir, exist_ok=True)
-
-    # load config
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
-    algo = cfg["algo"].lower()
-    params = cfg.get("params", {})
-
-    # load features/data
-    spec = load_feature_spec(args.features)
-    cols = resolve_feature_columns(spec, mode="all")
-    raw = load_data(args.data, limit=args.limit)
-    X = select_features(raw, cols).to_numpy()
-
-    # build + fit
-    pipe, needs_fit_predict = build_pipeline(algo, params)
-    if needs_fit_predict:
-        _ = pipe.fit_predict(X)
-    else:
-        pipe.fit(X)
-
-    # score & summarize
-    scores = anomaly_scores(algo, pipe, X)
-    smin, smax, sme, svar = float(np.min(scores)), float(np.max(scores)), float(np.mean(scores)), float(np.var(scores))
-
-    # histogram
-    hist_counts, hist_edges = np.histogram(scores, bins=args.bins)
-    hist_path = f"{outdir}/score_histogram.csv"
-    with open(hist_path, "w") as f:
-        f.write("bin_left,bin_right,count\n")
-        for i in range(len(hist_counts)):
-            f.write(f"{hist_edges[i]},{hist_edges[i+1]},{int(hist_counts[i])}\n")
-
-    # pass criteria
-    status = "pass" if (len(scores) > 0 and svar > 0) else "fail"
-
-    summary = {
-        "module": "model_zoo",
-        "status": status,
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "inputs": {
-            "algo": algo,
-            "params": params,
-            "data": args.data,
-            "features_yaml": args.features,
-            "limit": args.limit,
-        },
-        "fit": {
-            "rows": int(X.shape[0]),
-            "features": int(X.shape[1]),
-        },
-        "scores": {
-            "min": smin,
-            "max": smax,
-            "mean": sme,
-            "variance": svar,
-        },
-        "pass_criteria": {
-            "rows_gt_0": X.shape[0] > 0,
-            "features_gt_0": X.shape[1] > 0,
-            "variance_gt_0": svar > 0.0
-        },
-        "artifacts": {
-            "score_histogram_csv": hist_path
-        }
-    }
-
-    summary_path = f"{outdir}/summary.json"
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    # Append to global audit log
-    with open("artifacts/diagnostics/audit_log.jsonl", "a") as audit_f:
-        audit_f.write(json.dumps(summary) + "\n")
-
-    print(f"[Model] {status.upper()} — {algo} on {summary['fit']['rows']}x{summary['fit']['features']}, "
-          f"score var={svar:.6f}. Artifacts → {outdir}/")
-
-if __name__ == "__main__":
-    main()
-    
-#.............................
-python -m src.aaa.diagnostics.model_zoo_check \
-  --data data_stream/processed/date_2024-01-*/part-*.parquet \
-  --features configs/features/fs_test.yaml \
-  --config configs/experiments/iforest_cpu.yaml \
-  --limit 3000
-
-#=================================================
-mkdir -p src/aaa/exp
-mkdir -p src/aaa/diagnostics
-mkdir -p artifacts/diagnostics/metrics
-
-touch src/__init__.py
-touch src/aaa/__init__.py
-touch src/aaa/exp/__init__.py
-touch src/aaa/diagnostics/__init__.py
-
-# new module + diagnostic
-touch src/aaa/exp/metrics.py
-touch src/aaa/diagnostics/metrics_check.py
-
-#............................
-from __future__ import annotations
-import numpy as np
-import pandas as pd
-
-
-def topk_indices(scores: np.ndarray, k: int) -> np.ndarray:
-    """Return indices of top-k highest anomaly scores."""
-    if k <= 0:
-        return np.array([], dtype=int)
-    k = min(k, len(scores))
-    return np.argpartition(-scores, k - 1)[:k]
-
-
-def overlap_at_k(scores_a: np.ndarray, scores_b: np.ndarray, k: int) -> float:
-    """
-    Compare overlap between top-k sets of two score arrays.
-    Returns ratio in [0,1].
-    """
-    idx_a = set(topk_indices(scores_a, k))
-    idx_b = set(topk_indices(scores_b, k))
-    if not idx_a or not idx_b:
-        return 0.0
-    return len(idx_a & idx_b) / float(k)
-
-
-def score_summary(scores: np.ndarray) -> dict:
-    """Basic descriptive stats for anomaly scores."""
-    return {
-        "n": int(len(scores)),
-        "min": float(np.min(scores)),
-        "max": float(np.max(scores)),
-        "mean": float(np.mean(scores)),
-        "var": float(np.var(scores)),
-    }
-
-
-def attach_scores(df: pd.DataFrame, scores: np.ndarray, id_cols: list[str]) -> pd.DataFrame:
-    """Attach anomaly scores to a DataFrame with optional ID columns."""
-    out = df[id_cols].copy() if id_cols else pd.DataFrame(index=np.arange(len(scores)))
-    out["score"] = scores
-    return out
-    
-    
-#.............................::.
-
-from __future__ import annotations
-import os, json
-from datetime import datetime, timezone
-import numpy as np
-import pandas as pd
-
-from src.aaa.exp.metrics import topk_indices, overlap_at_k, score_summary, attach_scores
-
-
-def main():
-    outdir = "artifacts/diagnostics/metrics"
-    os.makedirs(outdir, exist_ok=True)
-
-    # synthetic scores
-    np.random.seed(42)
-    scores_a = np.random.randn(100)
-    scores_b = np.random.randn(100)
-
-    # test functions
-    idx = topk_indices(scores_a, 10)
-    overlap = overlap_at_k(scores_a, scores_b, 10)
-    summ = score_summary(scores_a)
-
-    df = pd.DataFrame({"device_id": np.arange(100)})
-    attached = attach_scores(df, scores_a, ["device_id"])
-    attached.head(20).to_csv(f"{outdir}/attached_sample.csv", index=False)
-
-    summary = {
-        "module": "metrics",
-        "status": "pass" if len(idx) == 10 and 0.0 <= overlap <= 1.0 else "fail",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "checks": {
-            "topk_len": len(idx),
-            "overlap@10": overlap,
-            "summary_stats": summ,
-        },
-        "artifacts": {
-            "attached_sample_csv": f"{outdir}/attached_sample.csv"
-        }
-    }
-
-    summary_path = f"{outdir}/summary.json"
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    # Append to audit log
-    with open("artifacts/diagnostics/audit_log.jsonl", "a") as audit_f:
-        audit_f.write(json.dumps(summary) + "\n")
-
-    print(f"[Metrics] {summary['status'].upper()} — "
-          f"topk_len={summary['checks']['topk_len']}, overlap@10={overlap:.2f}")
-
-
-if __name__ == "__main__":
-    main()
-    
-#................................
-
-python -m src.aaa.diagnostics.metrics_check
-
-#===================================
-mkdir -p src/aaa/exp
-mkdir -p src/aaa/diagnostics
-mkdir -p artifacts/diagnostics/runexp
-mkdir -p artifacts/models artifacts/reports artifacts/logs
-mkdir -p configs/experiments   # if you haven’t already
-
-touch src/__init__.py
-touch src/aaa/__init__.py
-touch src/aaa/exp/__init__.py
-touch src/aaa/diagnostics/__init__.py
-
-# new module + diagnostic
-touch src/aaa/exp/run_experiment.py
-touch src/aaa/diagnostics/runexp_check.py
-
-#....................
-mkdir -p src/aaa/exp
-mkdir -p src/aaa/diagnostics
-mkdir -p artifacts/diagnostics/runexp
-mkdir -p artifacts/models artifacts/reports artifacts/logs
-mkdir -p configs/experiments   # if you haven’t already
-
-touch src/__init__.py
-touch src/aaa/__init__.py
-touch src/aaa/exp/__init__.py
-touch src/aaa/diagnostics/__init__.py
-
-# new module + diagnostic
-touch src/aaa/exp/run_experiment.py
-touch src/aaa/diagnostics/runexp_check.py
-
-#.............................
-
-from __future__ import annotations
-import os, json, time, argparse, yaml
-from datetime import datetime, timezone
-import numpy as np
-import pandas as pd
-import mlflow
+from io import BytesIO
 import joblib
-import mlflow.sklearn
+from os import environ
+import aws_utils_lambda
+import pandas as pd
+from pandas import DataFrame
+import numpy as np
+import boto3
+import json
+from sklearn.ensemble import IsolationForest
+import time
+import logging
 
-from joblib import dump
-from .dataio import load_data
-from .features import load_feature_spec, resolve_feature_columns, select_features, feature_manifest
-from .model_zoo import build_pipeline, anomaly_scores
-from .metrics import topk_indices, score_summary
+log = logging.getLogger(__name__)
+log.setLevel(logging.INFO)
+log.propagate = True
 
 
-def _zscore_baseline(Xdf: pd.DataFrame) -> np.ndarray:
-    """Composite z baseline: per-row max absolute z over columns."""
-    mu = Xdf.mean(axis=0)
-    sd = Xdf.std(axis=0).replace(0, 1e-8)
-    z = (Xdf - mu) / sd
-    return z.abs().max(axis=1).to_numpy()
-
-
-def main():
-    ap = argparse.ArgumentParser(description="AAA unsupervised experiment runner (MLflow)")
-    ap.add_argument("--data", required=True, help="file/folder/glob path to data")
-    ap.add_argument("--features", required=True, help="features YAML (grouped schema)")
-    ap.add_argument("--config", required=True, help="experiment YAML (algo + params)")
-    ap.add_argument("--id-cols", default=None, help="comma list of ID cols to carry (overrides YAML i_columns)")
-    ap.add_argument("--feature-mode", choices=["all","groups","list"], default="all")
-    ap.add_argument("--feature-groups", default=None, help="comma list when mode=groups (e.g., SC,SS)")
-    ap.add_argument("--feature-list", default=None, help="comma list when mode=list")
-    ap.add_argument("--limit", type=int, default=None, help="row cap for quick runs")
-    ap.add_argument("--topk", type=int, default=200)
-    ap.add_argument("--mlflow-uri", default="sqlite:///mlflow.db")
-    args = ap.parse_args()
-
-    # Ensure artifact dirs
-    os.makedirs("artifacts/models", exist_ok=True)
-    os.makedirs("artifacts/reports", exist_ok=True)
-    os.makedirs("artifacts/logs", exist_ok=True)
-
-    # Load experiment config
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
-    algo = cfg["algo"].lower()
-    params = cfg.get("params", {})
-
-    # Load feature spec + resolve columns
-    spec = load_feature_spec(args.features)
-    if args.id_cols:
-        id_cols = [c.strip() for c in args.id_cols.split(",") if c.strip()]
-    else:
-        id_cols = list(spec.get("i_columns", []))
-
-    groups = [g.strip() for g in args.feature_groups.split(",")] if args.feature_groups else None
-    explicit = [c.strip() for c in args.feature_list.split(",")] if args.feature_list else None
-    cols = resolve_feature_columns(spec, mode=args.feature_mode, groups=groups, extra=explicit)
-
-    # Load data
-    t0 = time.time()
-    raw = load_data(args.data, limit=args.limit)
-    load_s = time.time() - t0
-
-    # ID frame
-    id_frame = pd.DataFrame()
-    for c in id_cols:
-        if c in raw.columns:
-            id_frame[c] = raw[c]
-    if id_frame.empty:
-        id_frame["row_id"] = np.arange(len(raw))
-
-    # Select/clean features
-    Xdf = select_features(raw, cols)
-    manifest = feature_manifest(list(Xdf.columns))
-
-    # Build pipeline and fit
-    pipe, needs_fit_predict = build_pipeline(algo, params)
-
-    mlflow.set_tracking_uri(args.mlflow_uri)
-    mlflow.set_experiment(f"AAA-Unsupervised/{spec['id']}/{algo}")
-
-    with mlflow.start_run(run_name=f"{algo}-{spec['id']}"):
-        # Params
-        mlflow.log_params({
-            "algo": algo,
-            "feature_set": spec["id"],
-            "feature_mode": args.feature_mode,
-            "feature_groups": ",".join(groups) if groups else "",
-            "n_features": manifest["n_features"],
-            **params,
-        })
-        mlflow.log_dict(manifest, f"reports/feature_manifest_{spec['id']}.json")
-
-        # Fit
-        t1 = time.time()
-        X = Xdf.to_numpy()
-        if needs_fit_predict:
-            _ = pipe.fit_predict(X)
-        else:
-            pipe.fit(X)
-        fit_s = time.time() - t1
-
-        # Save and log model
-        os.makedirs('artifacts/models', exist_ok= True)
-        local_model_path = f"artifacts/models/{algo}_{spec['id']}.joblib"
-        dump(pipe, local_model_path)
-
-        # log the model inside the active MLflow run
-        mlflow.sklearn.log_model(
-            sk_model= pipe,
-            artifact_path= 'model'
-        )
-
-        # also register in the Model registry for versioning/staging
-        mlflow.sklearn.log_model(
-            sk_model= pipe,
-            artifact_path= 'model_reg',
-            registered_model_name= f"{algo}_{spec['id']}"
-        )
-
-        # Score
-        scores = anomaly_scores(algo, pipe, X)
-        summ = score_summary(scores)
-
-        for k, v in {
-            "fit_time_s": fit_s,
-            "rows": int(X.shape[0]),
-            "score_min": summ["min"],
-            "score_max": summ["max"],
-            "score_mean": summ["mean"],
-            "score_var": summ["var"],
-            "load_time_s": load_s,
-        }.items():
-            mlflow.log_metric(k, v, step= 0)
-
-        # Baseline overlap vs zscore@K
-        zscores = _zscore_baseline(Xdf)
-        K = int(args.topk)
-        a_idx = topk_indices(scores, K)
-        z_idx = topk_indices(zscores, K)
-        overlap = len(set(a_idx.tolist()) & set(z_idx.tolist())) / float(max(1, K))
-        mlflow.log_param('topk', K)
-        mlflow.log_metric("overlap_vs_zscore_at_K", overlap)
-
-        # Export Top-K
-        top_df = id_frame.iloc[a_idx].copy()
-        top_df["score"] = scores[a_idx]
-        top_path = f"artifacts/reports/topk_{algo}_{spec['id']}.csv"
-        top_df.to_csv(top_path, index=False)
-        mlflow.log_artifact(top_path)
-
-        # Score histogram artifact
-        hist_counts, hist_edges = np.histogram(scores, bins=30)
-        hist_path = f"artifacts/reports/score_hist_{algo}_{spec['id']}.csv"
-        with open(hist_path, "w") as f:
-            f.write("bin_left,bin_right,count\n")
-            for i in range(len(hist_counts)):
-                f.write(f"{hist_edges[i]},{hist_edges[i+1]},{int(hist_counts[i])}\n")
-        mlflow.log_artifact(hist_path)
-
-        # Save model
-        model_path = f"artifacts/models/{algo}_{spec['id']}.joblib"
-        joblib.dump(pipe, model_path)
-        mlflow.log_artifact(model_path)
-
-        # Run meta log
-        meta = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "algo": algo,
-            "feature_set": spec["id"],
-            "n_features": manifest["n_features"],
-            "rows": int(X.shape[0]),
-            "fit_time_s": fit_s,
-            "topk": K,
-            "overlap_vs_zscore@K": overlap,
-            "data_path": args.data,
-            "features_yaml": args.features,
-            "config_yaml": args.config,
-        }
-        with open("artifacts/logs/run_meta.json", "w") as f:
-            json.dump(meta, f, indent=2)
-        mlflow.log_artifact("artifacts/logs/run_meta.json")
-
-    print(
-        f"Run complete: algo={algo}, fs={spec['id']}, n={len(Xdf)} rows, "
-        f"fit_time={fit_s:.2f}s. Top-K → {top_path}"
+def create_anomaly_fields(df: DataFrame, cause: str) -> DataFrame:
+    # Map cause to column names
+    df["zero_bytes_normal_count"] = np.where(
+        df["rolling_mean_zero_bytes_Count"] > 5, 5, df["rolling_mean_zero_bytes_Count"]
     )
 
-
-if __name__ == "__main__":
-    main()
-#...................................
-from __future__ import annotations
-import os, json, subprocess, shlex
-from datetime import datetime, timezone
-
-def main():
-    outdir = "artifacts/diagnostics/runexp"
-    os.makedirs(outdir, exist_ok=True)
-
-    # Edit these two paths for your environment if needed:
-    data = "data_stream/processed/date_2024-01-*/part-*.parquet"
-    features_yaml = "configs/features/fs_test.yaml"
-    config_yaml = "configs/experiments/iforest_cpu.yaml"
-
-    cmd = (
-        "python -m src.aaa.exp.run_experiment "
-        f"--data {shlex.quote(data)} "
-        f"--features {shlex.quote(features_yaml)} "
-        f"--config {shlex.quote(config_yaml)} "
-        "--limit 3000 --topk 50"
-    )
-    print(f"[RunExpCheck] Launching: {cmd}")
-    ret = subprocess.run(cmd, shell=True)
-    status = "pass" if ret.returncode == 0 else "fail"
-
-    # Verify expected artifacts exist
-    expected = [
-        "artifacts/reports",
-        "artifacts/models",
-        "mlruns",  # MLflow backend dir
-    ]
-    exists = {p: os.path.exists(p) for p in expected}
-
-    summary = {
-        "module": "run_experiment",
-        "status": "pass" if (status == "pass" and all(exists.values())) else "fail",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "inputs": {
-            "data": data,
-            "features_yaml": features_yaml,
-            "config_yaml": config_yaml,
-            "limit": 3000,
-            "topk": 50,
-        },
-        "checks": exists,
-        "artifacts_hint": {
-            "reports_dir": "artifacts/reports",
-            "models_dir": "artifacts/models",
-            "mlflow_dir": "mlruns"
-        }
+    column_map = {
+        "zeroBytes": (
+            "max_zero_bytes_Count",
+            "ZerobytesUsagenAnomaly",
+            "zero_bytes_normal_count",
+        ),
+        "shortSession": (
+            "max_shortLength",
+            "shortSessionAnomaly",
+            "expanding_mean_max_shortLength",
+        ),
     }
-    with open(f"{outdir}/summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
+    column_count, column_anomaly, column_normal = column_map[cause]
 
-    # Append to global audit log
-    with open("artifacts/diagnostics/audit_log.jsonl", "a") as audit_f:
-        audit_f.write(json.dumps(summary) + "\n")
+    # normal session counts for particular cause
+    df[f"NormalSessionCount_{cause}"] = np.where(
+        df[column_anomaly] == 0, df[column_count], np.nan
+    )
 
-    print(f"[RunExpCheck] {summary['status'].upper()} — see {outdir}/summary.json")
+    df[f"NormalSessionCount_{cause}"] = (
+        df[f"NormalSessionCount_{cause}"].fillna(df[column_normal])
+    ).astype(int)
 
-if __name__ == "__main__":
-    main()
-    
-#...............................
-# optional: start MLflow UI in another terminal
-mlflow ui --backend-store-uri sqlite:///mlflow.db --default-artifact-root ./mlruns
+    df[f"AnomalySessionCount_{cause}"] = np.where(
+        df[column_anomaly] == 1,
+        df[column_count],
+        df["AnomalySessionCount"],
+    ).astype(int)
 
-# run the smoke check
-python -m src.aaa.diagnostics.runexp_check
+    anomaly_count = df[column_anomaly].sum()
+    log.debug(f"{anomaly_count} anomalies detected for cause: {cause}")
 
-#................................
-python -m src.aaa.exp.run_experiment \
-  --data data_stream/processed/date_2024-01-*/part-*.parquet \
-  --features configs/features/fs_test.yaml \
-  --config configs/experiments/iforest_cpu.yaml \
-  --limit 3000 \
-  --topk 50
+    return df
 
-#=========================================
-import mlflow
-from mlflow.tracking import MlflowClient
 
-mlflow.set_tracking_uri("sqlite:////Users/bells1/Projects/AAA_Pipeline_Practice/mlflow.db")
-client = MlflowClient()
+def create_output_df(df: DataFrame) -> DataFrame:
+    # add anomaly cause field:
+    df["ShortSessionLabel"] = np.where(
+        df["shortSessionAnomaly"] == 1, "ShortSession", ""
+    )
+    df["ZeroBytesLabel"] = np.where(
+        df["ZerobytesUsagenAnomaly"] == 1, "ZeroByteSession", ""
+    )
 
-# list deleted, find your experiment
-for e in client.search_experiments(view_type=mlflow.entities.ViewType.DELETED_ONLY):
-    print(e.experiment_id, e.name)
+    # Concatenate the labels with a comma separator when both conditions are true
+    df["AnomalyCause"] = (
+        df["ShortSessionLabel"]
+        + np.where(
+            (df["ShortSessionLabel"] != "") & (df["ZeroBytesLabel"] != ""), ", ", ""
+        )
+        + df["ZeroBytesLabel"]
+    )
+    df.drop(["ShortSessionLabel", "ZeroBytesLabel"], axis=1, inplace=True)
 
-# restore by ID
-client.restore_experiment("<ID>")
+    for cause in ("zeroBytes", "shortSession"):
+        df = create_anomaly_fields(df, cause)
+
+    # add additional field
+    df["DurationInMin"] = 60
+    df["date"] = pd.to_datetime(df["date"])
+    df["hour"] = df["hour"].astype(int)
+    df["AnomalyEventTime"] = (
+        df["date"] + pd.to_timedelta(df["hour"], unit="h")
+    ).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    num_missing = (df["AnomalyCause"] == "").sum()
+    log.info(f"{num_missing} rows have no anomaly cause assigned") 
+
+    num_with_cause = (df["AnomalyCause"] != "").sum()
+    log.info(f"{num_with_cause} rows have anomaly causes assigned")
+
+    return df
+
+
+def create_anomaly_df(df: DataFrame) -> dict:
+    df = create_output_df(df)
+    # get the anomaly rows
+    df_anomaly = df[(df["anomaly"] == 1) & (df["AnomalyCause"] != "")]
+    log.info(f"{len(df_anomaly)} anomaly rows retained for processing (non-empty AnomalyCause)")
+
+    df_anomaly = df_anomaly[
+        [
+            "app_id",
+            "device_id",
+            "AnomalyCause",
+            "NormalSessionCount_zeroBytes",
+            "AnomalySessionCount_zeroBytes",
+            "NormalSessionCount_shortSession",
+            "AnomalySessionCount_shortSession",
+            "DurationInMin",
+            "AvgSessionLengthTime",
+            "AnomalyEventTime",
+            "anomaly",
+        ]
+    ]
+
+    df_anomaly["AnomalyCause"] = df_anomaly["AnomalyCause"].str.split(", ")
+
+    # Split the rows only where multiple causes are present
+    df_anomaly = df_anomaly.explode("AnomalyCause")
+
+    # Mapping the columns based on causes
+    conditions = [
+        df_anomaly["AnomalyCause"] == "ShortSession",
+        df_anomaly["AnomalyCause"] == "ZeroByteSession",
+    ]
+
+    choices_normal = [
+        df_anomaly["NormalSessionCount_shortSession"],
+        df_anomaly["NormalSessionCount_zeroBytes"],
+    ]
+
+    choices_anomaly = [
+        df_anomaly[
+            "AnomalySessionCount_shortSession"
+        ],  # Fixed typo in the original code
+        df_anomaly["AnomalySessionCount_zeroBytes"],
+    ]
+
+    # Apply vectorized mapping
+    df_anomaly["NormalSessionCount"] = np.select(
+        conditions, choices_normal, default=None
+    )
+    df_anomaly["AnomalySessionCount"] = np.select(
+        conditions, choices_anomaly, default=None
+    )
+
+    # Drop the original columns
+    df_anomaly.drop(
+        [
+            "NormalSessionCount_zeroBytes",
+            "AnomalySessionCount_zeroBytes",
+            "NormalSessionCount_shortSession",
+            "AnomalySessionCount_shortSession",
+            "anomaly",
+        ],
+        axis=1,
+        inplace=True,
+    )
+
+    return df_anomaly
+
+
+def send_to_kinesis(records, stream_name, region):
+
+    log.info(f"Sending {len(records)} records to Kinesis stream: {stream_name} in region: {region}")
+
+    # Create a Kinesis client
+    kinesis_client = boto3.client("kinesis", region_name=region)
+
+    # Convert the string data to bytes
+    bytes_data = records.encode("utf-8")
+    try:
+        kinesis_client.put_record(
+            StreamName=stream_name,
+            Data=bytes_data,
+            PartitionKey="DeviceId",  # A key used to distribute data across shards
+        )
+    except Exception as e:
+        log.error(f"Failed to put record in the kinesis stream: {e}", exc_info=True)
+        raise  # Re-raise to propagate error to Lambda
+
+
+def process_and_send_records(records, stream_name, region):
+    if records:
+        records = sorted(
+            records, key=lambda x: (x.get("DeviceId"), x.get("AnomalyEventTime"))
+        )
+        records = {"events": records}
+        records = json.dumps(records)
+
+        #log.debug(f"Sending JSON batch of {len(json.loads(records)['events'])} records to Kinesis")
+        send_to_kinesis(records, stream_name, region)
+
+
+def batch_records(records, batch_size):
+    for i in range(0, len(records), batch_size):
+        yield records[i : i + batch_size]
+
+
+def send_records_to_kinesis(df: DataFrame, stream_name, region):
+
+    # get the correct columns for each anomaly cause
+    df.rename(columns={"device_id": "DeviceId"}, inplace=True)
+    df["AvgSessionLengthTime"] = df["AvgSessionLengthTime"].fillna(0)
+    df["AvgSessionLengthTime"] = df["AvgSessionLengthTime"].astype(int)
+    df["AppId"] = df["app_id"].astype(int)
+    df["AnomalyEventTime"] = df["AnomalyEventTime"].astype(str)
+    df_sent = df[
+        [
+            "DeviceId",
+            "AppId",
+            "AnomalyCause",
+            "NormalSessionCount",
+            "AnomalySessionCount",
+            "DurationInMin",
+            "AvgSessionLengthTime",
+            "AnomalyEventTime",
+        ]
+    ]
+
+    # Convert DataFrame to list of dictionaries
+    records = df_sent.to_dict("records")
+    log.info(f"Preparing to send {len(records)} records to Kinesis stream: {stream_name} in region: {region}")
+
+    # Process records
+    for record in records:
+        if record["AnomalyCause"] == "ZeroByteSession":
+            record.pop("AvgSessionLengthTime", None)
+
+    # Send records in batches and each batch contains 1000 records
+    for batch in batch_records(records, 1000):
+        log.debug(f"Sending batch of {len(batch)} records to Kinesis")
+        process_and_send_records(batch, stream_name, region)
+        time.sleep(1)
+
+
+def load_model_from_s3(
+    loaded_models: dict,
+    prefix_model: str,
+    pod_name_model: str,
+    region_model: str,
+    app_id: str,
+) -> IsolationForest:
+
+    if app_id in loaded_models:
+        log.debug(f"Model for app_id={app_id} loaded from cache") #1
+        return loaded_models[app_id]
+    else:
+        # Create a boto3 client
+        s3_client = boto3.client("s3")
+        try:
+            # Load the model from the buffer using joblib
+            with aws_utils_lambda.get_aurora_postgresql_connection(
+                prefix_model, pod_name_model, region_model
+            ) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT model_path FROM ip_{pod_name_model}.aaa_model_path "
+                        f"WHERE app_id={app_id};"
+                    )
+                    row = cursor.fetchone()
+                    # Create a cloud watch alert for this error
+                    if row is None:
+                        log.error(
+                            f"No model_path found for app_id={app_id} in ip_{pod_name_model}.aaa_model_path" #2
+                        )
+                        return None
+                    bucket_name, model_key = aws_utils_lambda.split_s3_path(row[0])
+                    # # Create a buffer
+                    model_buffer = BytesIO()
+                    # # Download the model file from S3 to the buffer
+                    s3_client.download_fileobj(bucket_name, model_key, model_buffer)
+                    #
+                    # # Set the buffer's pointer to the beginning
+                    model_buffer.seek(0)
+
+                    model = joblib.load(model_buffer)
+                    log.info(f"Successfully loaded model for app_id={app_id} from {bucket_name}/{model_key}") #3
+
+                    loaded_models[app_id] = model
+
+            return model
+        except Exception as e:
+            # Create a cloud watch alert for this error
+            log.error(f"Error accessing model table for app_id={app_id}: {e}") #1 #4
+            return None
+
+
+def run_inferencing(loaded_models: dict, df: DataFrame) -> None:
+    log.info(f"Starting inferencing for {len(df)} rows across {df['app_id'].nunique()} app_ids")
+    prefix = environ.get("PREFIX")
+    pod_name = environ.get("POD_NAME")
+    region = environ.get("REGION_NAME")
+    df_output = pd.DataFrame()
+    log.info(f"Unique app_ids to process: {df['app_id'].unique().tolist()}")
+    for app_id in df["app_id"].unique():
+        
+        try:
+            df_app_id = df[df["app_id"] == app_id].copy()
+            log.info(f"Processing app_id={app_id}, records={len(df_app_id)}, devices={df_app_id['device_id'].nunique()}")
+            df_app_id.sort_values(
+                by=["app_id", "device_id", "date"], inplace=True, ignore_index=True
+            )
+
+            log.info(
+                f"app_id={app_id} flags: shortSessionAnomaly={df_app_id['shortSessionAnomaly'].sum()}, "
+                 f"ZerobytesUsagenAnomaly={df_app_id['ZerobytesUsagenAnomaly'].sum()}"
+                )
+
+            X = df_app_id[
+                [
+                    "session_count",
+                    "expanding_mean_session_count",
+                    "AnomalySessionCount",
+                    "max_shortLength",
+                    "expanding_mean_max_shortLength",
+                    "shortSessionAnomaly",
+                    "session_time",
+                    "expanding_mean_session_time",
+                    "sessionTimeAnomalyBasedOnHistory",
+                    "max_zero_bytes_Count",
+                    "rolling_mean_zero_bytes_Count",
+                    "ZerobytesUsagenAnomaly",
+                ]
+            ]
+            X = X.astype(float)
+            X = X.fillna(X.mean())
+            X = X.fillna(0)
+
+            model = load_model_from_s3(
+                loaded_models=loaded_models,
+                prefix_model=prefix,
+                pod_name_model=pod_name,
+                region_model=region,
+                app_id=app_id,
+            )
+            
+            if model:
+                df_app_id["anomaly"] = model.predict(X)
+
+                # do the mapping for IsolationForest model to 0 and 1 values, where 1 is Anomaly
+
+                df_app_id["anomaly"] = df_app_id["anomaly"].apply(
+                    lambda x: 1 if x == -1 else 0
+                )
+                df_anomalies: DataFrame = create_anomaly_df(df_app_id)
+
+                if len(df_anomalies) > 0:
+                    # get the number of anomalies detected
+                    df_output = pd.concat([df_output, df_anomalies], ignore_index=True)
+                    log.info(
+                        f"# of anomaly detected for app_id {app_id}: {len(df_anomalies)} for time {df_anomalies['AnomalyEventTime'].unique()}"
+                    )
+                else:
+                    log.info(f"no anomaly detected for app_id {app_id}")
+
+        except Exception as e:
+            # Create a cloud watch alert for this error
+            log.error(
+                f"Error in run_inferencing for app_id={app_id}: {e}", exc_info=True
+            )
+            raise  # Re-raise to propagate error to Lambda
+    # convert the anomaly dataframe to json and send to kinesis stream
+    if len(df_output) > 0:
+        try:
+            send_records_to_kinesis(
+                df_output, environ.get("KINESIS_STREAM_NAME"), region
+            )
+            log.info(f"Inferencing complete. Total anomalies sent from inferencing to Kinesis: {len(df_output)}")
+        except Exception as e:
+            # Create a cloud watch alert for this error
+            log.error(f"Error sending records to Kinesis: {e}", exc_info=True)
+            raise  # Re-raise to propagate error to Lambda
+    else:
+        log.info("no anomaly detected for all app_ids")
+
+    return
