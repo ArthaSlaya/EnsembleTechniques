@@ -1804,3 +1804,239 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+#=======================================
+severity metric
+#=======================================
+# --- AAA Severity Metric: notebook cell (paste-and-run) -----------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# =========================
+# 1) Core severity helpers
+# =========================
+
+def squash_tanh(z: pd.Series, scale: float = 3.0) -> pd.Series:
+    """
+    Map any z-score column to a smooth [0, 1] range using tanh(|z|/scale).
+    - scale≈3.0 => ~3σ maps near 1.0 (saturates gently)
+    NaN/±inf -> 0 contribution.
+    """
+    z = pd.to_numeric(z, errors="coerce").abs()
+    z = z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    return np.tanh(z / float(scale))
+
+
+def compute_component_scores(
+    df: pd.DataFrame,
+    z_cols: dict[str, str],
+    scale: float = 3.0,
+    prefix: str = ""
+) -> pd.DataFrame:
+    """
+    Create component scores (0-1) from z-score columns.
+
+    z_cols maps a short name to the actual column in df, e.g.:
+        {
+          "SC": "SC_z_score_session_cnt",
+          "SS": "SS_z_score_max",
+          "SL": "SL_z_score",
+          "ZB": "ZB_z_score",
+          "BU": "BU_z_score_bytes_usage",
+          "IDLE":"IDLE_z_idle",
+        }
+    """
+    out = df.copy()
+    for name, col in z_cols.items():
+        comp_col = f"{prefix}{name}_score"
+        out[comp_col] = squash_tanh(out[col]) if col in out.columns else 0.0
+    return out
+
+
+def compute_severity(
+    df: pd.DataFrame,
+    z_cols: dict[str, str],
+    weights: dict[str, float],
+    flag_cols: list[str] | None = None,
+    persistence_col: str | None = None,
+    scale: float = 3.0,
+    severity_name: str = "Severity_final",
+    label_name: str = "Severity_label",
+    label_bins: tuple[float, float] = (0.30, 0.70),
+    component_prefix: str = ""
+) -> pd.DataFrame:
+    """
+    1) Build per-feature component scores via tanh(|z|/scale).
+    2) Weighted blend -> Severity_S0
+    3) Optional boosts: flags (0/1) and persistence (0-1)
+    4) Clip to [0,1]; label Low/Medium/High.
+    """
+    assert set(weights.keys()) == set(z_cols.keys()), \
+        "weights and z_cols must have identical keys"
+
+    out = compute_component_scores(df, z_cols=z_cols, scale=scale, prefix=component_prefix)
+
+    # Weighted blend of components -> S0
+    S0 = 0.0
+    for name in z_cols.keys():
+        comp_col = f"{component_prefix}{name}_score"
+        S0 = S0 + float(weights[name]) * out[comp_col].fillna(0.0)
+    out["Severity_S0"] = S0
+
+    # Optional flag boost (normalized)
+    if flag_cols:
+        present = [c for c in flag_cols if c in out.columns]
+        if present:
+            B = out[present].fillna(0).sum(axis=1) / 3.0  # cap @1 later
+            B = B.clip(0, 1)
+        else:
+            B = 0.0
+    else:
+        B = 0.0
+
+    # Optional persistence term (ideally already 0-1)
+    if persistence_col and persistence_col in out.columns:
+        P = out[persistence_col].fillna(0.0)
+    else:
+        P = 0.0
+
+    # Final severity (coeffs are tunable; start conservative)
+    out[severity_name] = np.clip(0.85 * out["Severity_S0"] + 0.10 * B + 0.05 * P, 0.0, 1.0)
+
+    # Labels
+    lo, hi = label_bins
+    def _label(x: float) -> str:
+        if x < lo: return "Low"
+        if x < hi: return "Medium"
+        return "High"
+
+    out[label_name] = out[severity_name].apply(_label)
+    return out
+
+
+# =========================
+# 2) Plotting helpers
+# =========================
+
+def plot_severity_trend(
+    df: pd.DataFrame,
+    device_id_val,
+    date_col: str = "date",
+    severity_col: str = "Severity_final",
+    title: str | None = None
+) -> None:
+    """
+    Single-device severity trend over time (matplotlib only).
+    """
+    dd = df[df.get("device_id") == device_id_val].copy()
+    if dd.empty:
+        raise ValueError(f"No rows for device_id={device_id_val}")
+    dd = dd.sort_values(date_col)
+    x = pd.to_datetime(dd[date_col])
+    y = dd[severity_col].astype(float)
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(x, y, marker="o")
+    plt.title(title or f"Severity trend | device_id={device_id_val}")
+    plt.xlabel(date_col)
+    plt.ylabel(severity_col)
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_component_trend(
+    df: pd.DataFrame,
+    device_id_val,
+    component_cols: list[str],
+    date_col: str = "date",
+    title: str | None = None
+) -> None:
+    """
+    Multiple component score lines (0-1) for one device across time.
+    """
+    dd = df[df.get("device_id") == device_id_val].copy()
+    if dd.empty:
+        raise ValueError(f"No rows for device_id={device_id_val}")
+    dd = dd.sort_values(date_col)
+    x = pd.to_datetime(dd[date_col])
+
+    plt.figure(figsize=(10, 4))
+    for c in component_cols:
+        if c in dd.columns:
+            plt.plot(x, dd[c].astype(float), marker="o", label=c)
+    plt.title(title or f"Component scores | device_id={device_id_val}")
+    plt.xlabel(date_col)
+    plt.ylabel("component score (0–1)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# =========================
+# 3) DRIVER (edit & run)
+# =========================
+# Expect your notebook to already have a DataFrame named `df`
+# with columns like:
+#   - 'device_id', 'date'
+#   - z-score columns (see z_cols below)
+#   - optional: anomaly flag columns, persistence column
+
+# --- (A) Map your z-score columns here ---
+z_cols = {
+    "SC":  "SC_z_score_session_cnt",
+    "SS":  "SS_z_score_max",
+    "SL":  "SL_z_score",
+    "ZB":  "ZB_z_score",
+    "BU":  "BU_z_score_bytes_usage",
+    "IDLE":"IDLE_z_idle",
+}
+
+# --- (B) Choose weights (sum to 1). Start balanced; tune later. ---
+weights = {"SC":0.15, "SS":0.15, "SL":0.20, "ZB":0.20, "BU":0.15, "IDLE":0.15}
+
+# --- (C) Optional: anomaly flags & persistence (if present in df) ---
+flag_cols = [
+    "SC_AnomalySessionCount", "SS_ShortSessionAnomaly",
+    "ZB_ZeroByteAnomaly", "BU_ZeroBytesUsageAnomaly",
+    "IDLE_IdleTimeAnomalyFlag"
+]
+persistence_col = None  # e.g., "recent_anomaly_rate"
+
+# --- (D) Compute severity per row ---
+# Replace `df` below with your actual DataFrame variable if named differently.
+try:
+    df_sev = compute_severity(
+        df=df,                      # your Gold-layer DataFrame
+        z_cols=z_cols,
+        weights=weights,
+        flag_cols=flag_cols,        # or None
+        persistence_col=persistence_col,  # or None
+        scale=3.0,
+        severity_name="Severity_final",
+        label_name="Severity_label",
+        label_bins=(0.30, 0.70),
+    )
+except NameError as _:
+    raise NameError("No DataFrame named `df` found. Please create/load your Gold-layer DataFrame as `df` first.")
+
+# Peek
+display_cols = ["device_id", "date", "Severity_S0", "Severity_final", "Severity_label"]
+for k in z_cols.keys():
+    display_cols.append(f"{k}_score")
+print(df_sev[display_cols].head())
+
+# --- (E) Plot trends for a device ---
+# Set a device_id that exists in your df:
+DEVICE_TO_PLOT = df_sev["device_id"].iloc[0] if not df_sev.empty else None
+
+if DEVICE_TO_PLOT is not None:
+    plot_severity_trend(df_sev, device_id_val=DEVICE_TO_PLOT, date_col="date", severity_col="Severity_final")
+    comp_cols = [f"{k}_score" for k in z_cols.keys()]
+    plot_component_trend(df_sev, device_id_val=DEVICE_TO_PLOT, component_cols=comp_cols, date_col="date")
+
+# --- (F) (Optional) Save results ---
+# df_sev.to_csv("severity_scored.csv", index=False)
+# -------------------------------------------------------------------------------
