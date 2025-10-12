@@ -2081,68 +2081,156 @@ def plot_daily_severe_device_counts(counts_df: pd.DataFrame,
 #                                            severity_col="Severity_final", threshold=0.7, rolling_days=7)
 # plot_daily_severe_device_counts(severe_counts)
 
-# =========================
-# 3) DRIVER (edit & run)
-# =========================
-# Expect your notebook to already have a DataFrame named `df`
-# with columns like:
-#   - 'device_id', 'date'
-#   - z-score columns (see z_cols below)
-#   - optional: anomaly flag columns, persistence column
+# =========================================
+# severity_handler.py (drop-in handler)
+# =========================================
+from __future__ import annotations
+import pandas as pd
 
-# --- (A) Map your z-score columns here ---
-z_cols = {
-    "SC":  "SC_z_score_session_cnt",
-    "SS":  "SS_z_score_max",
-    "SL":  "SL_z_score",
-    "ZB":  "ZB_z_score",
-    "BU":  "BU_z_score_bytes_usage",
-    "IDLE":"IDLE_z_idle",
-}
+from severity_metric import (
+    compute_severity,
+    plot_severity_trend,
+    plot_component_trend,
+    daily_anomaly_device_counts,
+    plot_daily_anomaly_device_counts,
+    daily_severe_device_counts,
+    plot_daily_severe_device_counts,
+)
 
-# --- (B) Choose weights (sum to 1). Start balanced; tune later. ---
-weights = {"SC":0.15, "SS":0.15, "SL":0.20, "ZB":0.20, "BU":0.15, "IDLE":0.15}
+def run_severity_handler(
+    df: pd.DataFrame,
+    # --- column mapping ---
+    z_cols: dict | None = None,
+    weights: dict | None = None,
+    flag_cols: list[str] | None = None,      # e.g., ["anomaly", "shortSessionAnomaly","ZerobytesUsagenAnomaly"]
+    persistence_col: str | None = None,      # e.g., "recent_anomaly_rate"
+    # --- identifiers & fields ---
+    date_col: str = "date",
+    device_col: str = "device_id",
+    severity_col: str = "Severity_final",
+    label_col: str = "Severity_label",
+    # --- plotting control ---
+    device_id_to_plot=None,                  # if None, picks first found
+    severity_threshold: float = 0.7,         # used in fleet severity plot
+    rolling_days: int = 7,                   # smoothing window for fleet plots
+    do_plots: bool = True,
+    # --- compute options ---
+    tanh_scale: float = 3.0,
+    label_bins: tuple[float, float] = (0.30, 0.70),
+    # --- output ---
+    save_csv_path: str | None = None,
+):
+    """
+    End-to-end severity computation + visualization.
 
-# --- (C) Optional: anomaly flags & persistence (if present in df) ---
-flag_cols = [
-    "SC_AnomalySessionCount", "SS_ShortSessionAnomaly",
-    "ZB_ZeroByteAnomaly", "BU_ZeroBytesUsageAnomaly",
-    "IDLE_IdleTimeAnomalyFlag"
-]
-persistence_col = None  # e.g., "recent_anomaly_rate"
+    Returns
+    -------
+    df_sev : pd.DataFrame           # original df + component scores + Severity_S0 + Severity_final + label
+    daily_anom : pd.DataFrame | None    # fleet trend from anomaly flags (if any flag column provided/existing)
+    daily_sev  : pd.DataFrame           # fleet trend from severity threshold
+    """
 
-# --- (D) Compute severity per row ---
-# Replace `df` below with your actual DataFrame variable if named differently.
-try:
+    # Defaults for z_cols / weights if not supplied
+    if z_cols is None:
+        z_cols = {
+            "SC":  "SC_z_score_session_cnt",
+            "SS":  "SS_z_score_max",
+            "SL":  "SL_z_score",
+            "ZB":  "ZB_z_score",
+            "BU":  "BU_z_score_bytes_usage",
+            "IDLE":"IDLE_z_idle",
+        }
+    if weights is None:
+        weights = {"SC":0.15, "SS":0.15, "SL":0.20, "ZB":0.20, "BU":0.15, "IDLE":0.15}
+
+    # --- 1) Compute severity (row-wise)
     df_sev = compute_severity(
-        df=df,                      # your Gold-layer DataFrame
+        df=df,
         z_cols=z_cols,
         weights=weights,
-        flag_cols=flag_cols,        # or None
-        persistence_col=persistence_col,  # or None
-        scale=3.0,
-        severity_name="Severity_final",
-        label_name="Severity_label",
-        label_bins=(0.30, 0.70),
+        flag_cols=flag_cols,              # None in Gold; list in Inference to include model flags
+        persistence_col=persistence_col,  # None unless you compute a recent rate
+        scale=tanh_scale,
+        severity_name=severity_col,
+        label_name=label_col,
+        label_bins=label_bins,
     )
-except NameError as _:
-    raise NameError("No DataFrame named `df` found. Please create/load your Gold-layer DataFrame as `df` first.")
 
-# Peek
-display_cols = ["device_id", "date", "Severity_S0", "Severity_final", "Severity_label"]
-for k in z_cols.keys():
-    display_cols.append(f"{k}_score")
-print(df_sev[display_cols].head())
+    # --- 2) Per-device plots
+    if do_plots and not df_sev.empty:
+        # choose a device to plot
+        dev = device_id_to_plot
+        if dev is None and device_col in df_sev.columns:
+            dev = df_sev[device_col].iloc[0]
 
-# --- (E) Plot trends for a device ---
-# Set a device_id that exists in your df:
-DEVICE_TO_PLOT = df_sev["device_id"].iloc[0] if not df_sev.empty else None
+        if dev is not None:
+            # Overall severity trend
+            plot_severity_trend(
+                df_sev.rename(columns={device_col: "device_id", date_col: "date"}),
+                device_id_val=dev,
+                date_col="date",
+                severity_col=severity_col,
+                title=f"Severity trend | {device_col}={dev}",
+            )
 
-if DEVICE_TO_PLOT is not None:
-    plot_severity_trend(df_sev, device_id_val=DEVICE_TO_PLOT, date_col="date", severity_col="Severity_final")
-    comp_cols = [f"{k}_score" for k in z_cols.keys()]
-    plot_component_trend(df_sev, device_id_val=DEVICE_TO_PLOT, component_cols=comp_cols, date_col="date")
+            # Component trend
+            comp_cols = [f"{k}_score" for k in z_cols.keys()]
+            plot_component_trend(
+                df_sev.rename(columns={device_col: "device_id", date_col: "date"}),
+                device_id_val=dev,
+                component_cols=comp_cols,
+                date_col="date",
+                title=f"Component scores | {device_col}={dev}",
+            )
 
-# --- (F) (Optional) Save results ---
-# df_sev.to_csv("severity_scored.csv", index=False)
-# -------------------------------------------------------------------------------
+    # --- 3) Fleet-level plots (daily counts)
+    daily_anom = None
+    # 3a) anomaly-flag-based trend (only if a flag column was provided and exists)
+    if do_plots and flag_cols:
+        # build a composite flag OR just use one column — here we use OR over provided flags
+        present_flags = [c for c in flag_cols if c in df_sev.columns]
+        if present_flags:
+            tmp = df_sev.copy()
+            tmp["__is_anomalous__"] = (tmp[present_flags].fillna(0).sum(axis=1) > 0).astype(int)
+
+            daily_anom = daily_anomaly_device_counts(
+                tmp.rename(columns={date_col: "date", device_col: "device_id"}),
+                date_col="date",
+                device_col="device_id",
+                flag_col="__is_anomalous__",
+                rolling_days=rolling_days,
+            )
+            plot_daily_anomaly_device_counts(daily_anom)
+
+    # 3b) severity-threshold trend (always available)
+    daily_sev = daily_severe_device_counts(
+        df_sev.rename(columns={date_col: "date", device_col: "device_id"}),
+        date_col="date",
+        device_col="device_id",
+        severity_col=severity_col,
+        threshold=severity_threshold,
+        rolling_days=rolling_days,
+    )
+    if do_plots:
+        plot_daily_severe_device_counts(daily_sev)
+
+    # --- 4) Optional save
+    if save_csv_path:
+        df_sev.to_csv(save_csv_path, index=False)
+
+    return df_sev, daily_anom, daily_sev
+
+
+# ---------------------------
+# Example usage (uncomment):
+# ---------------------------
+# df = ...  # your Gold or Inference DataFrame
+# df_sev, daily_anom, daily_sev = run_severity_handler(
+#     df=df,
+#     flag_cols=None,              # Gold: None | Inference: ["anomaly","shortSessionAnomaly","ZerobytesUsagenAnomaly"]
+#     device_id_to_plot=None,      # or a specific device id
+#     severity_threshold=0.7,
+#     rolling_days=7,
+#     do_plots=True,
+#     save_csv_path=None,
+# )
