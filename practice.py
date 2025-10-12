@@ -1974,6 +1974,112 @@ def plot_component_trend(
     plt.tight_layout()
     plt.show()
 
+import pandas as pd
+import matplotlib.pyplot as plt
+
+def daily_anomaly_device_counts(df: pd.DataFrame,
+                                date_col: str = "date",
+                                device_col: str = "device_id",
+                                flag_col: str = "anomaly",
+                                rolling_days: int | None = 7) -> pd.DataFrame:
+    """
+    Returns a DataFrame with columns: [date, devices_flagged, devices_flagged_rolling]
+    Counts UNIQUE devices per day where df[flag_col] == 1.
+    """
+    dd = df.copy()
+    dd[date_col] = pd.to_datetime(dd[date_col])
+    # keep rows that are flagged
+    dd = dd[dd[flag_col] == 1]
+
+    # unique devices per day
+    out = (dd.drop_duplicates([date_col, device_col])
+             .groupby(date_col)[device_col]
+             .nunique()
+             .rename("devices_flagged")
+             .reset_index()
+           )
+
+    if rolling_days:
+        out["devices_flagged_rolling"] = (
+            out["devices_flagged"].rolling(rolling_days, min_periods=1).mean()
+        )
+    return out
+
+def plot_daily_anomaly_device_counts(counts_df: pd.DataFrame,
+                                     date_col: str = "date",
+                                     value_col: str = "devices_flagged",
+                                     rolling_col: str | None = "devices_flagged_rolling",
+                                     title: str = "Daily devices flagged as anomaly") -> None:
+    x = pd.to_datetime(counts_df[date_col])
+    y = counts_df[value_col].astype(float)
+
+    plt.figure(figsize=(10,4))
+    plt.plot(x, y, marker="o", label=value_col)
+    if rolling_col and rolling_col in counts_df.columns:
+        plt.plot(x, counts_df[rolling_col].astype(float), marker="o", label=rolling_col)
+    plt.title(title)
+    plt.xlabel(date_col)
+    plt.ylabel("unique devices")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# Example:
+# counts = daily_anomaly_device_counts(df, date_col="date", device_col="device_id", flag_col="anomaly", rolling_days=7)
+# plot_daily_anomaly_device_counts(counts)
+
+def daily_severe_device_counts(df: pd.DataFrame,
+                               date_col: str = "date",
+                               device_col: str = "device_id",
+                               severity_col: str = "Severity_final",
+                               threshold: float = 0.7,
+                               rolling_days: int | None = 7) -> pd.DataFrame:
+    """
+    Returns a DataFrame with columns: [date, devices_severe, devices_severe_rolling]
+    Counts UNIQUE devices per day whose severity >= threshold.
+    """
+    dd = df.copy()
+    dd[date_col] = pd.to_datetime(dd[date_col])
+    dd = dd[pd.to_numeric(dd[severity_col], errors="coerce") >= threshold]
+
+    out = (dd.drop_duplicates([date_col, device_col])
+             .groupby(date_col)[device_col]
+             .nunique()
+             .rename("devices_severe")
+             .reset_index()
+           )
+
+    if rolling_days:
+        out["devices_severe_rolling"] = (
+            out["devices_severe"].rolling(rolling_days, min_periods=1).mean()
+        )
+    return out
+
+def plot_daily_severe_device_counts(counts_df: pd.DataFrame,
+                                    date_col: str = "date",
+                                    value_col: str = "devices_severe",
+                                    rolling_col: str | None = "devices_severe_rolling",
+                                    title: str = "Daily devices above severity threshold") -> None:
+    x = pd.to_datetime(counts_df[date_col])
+    y = counts_df[value_col].astype(float)
+
+    plt.figure(figsize=(10,4))
+    plt.plot(x, y, marker="o", label=value_col)
+    if rolling_col and rolling_col in counts_df.columns:
+        plt.plot(x, counts_df[rolling_col].astype(float), marker="o", label=rolling_col)
+    plt.title(title)
+    plt.xlabel(date_col)
+    plt.ylabel("unique devices")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# Example:
+# severe_counts = daily_severe_device_counts(df_out, date_col="date", device_col="device_id",
+#                                            severity_col="Severity_final", threshold=0.7, rolling_days=7)
+# plot_daily_severe_device_counts(severe_counts)
 
 # =========================
 # 3) DRIVER (edit & run)
