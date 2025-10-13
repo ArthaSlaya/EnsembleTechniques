@@ -1805,432 +1805,533 @@ def main():
 if __name__ == "__main__":
     main()
     
-#=======================================
-severity metric
-#=======================================
-# --- AAA Severity Metric: notebook cell (paste-and-run) -----------------------
+# severity_metric.py  (compute-only, reusable in Gold & Inference)
+from __future__ import annotations
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Optional
 
-# =========================
-# 1) Core severity helpers
-# =========================
+# ---------------------------
+# Squash / scaling utilities
+# ---------------------------
 
-def squash_tanh(z: pd.Series, scale: float = 3.0) -> pd.Series:
-    """
-    Map any z-score column to a smooth [0, 1] range using tanh(|z|/scale).
-    - scale≈3.0 => ~3σ maps near 1.0 (saturates gently)
-    NaN/±inf -> 0 contribution.
-    """
-    z = pd.to_numeric(z, errors="coerce").abs()
-    z = z.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+def _to_num(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    return s.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+def squash_tanh(z: pd.Series, scale: float = 3.0, use_abs: bool = True) -> pd.Series:
+    """Smoothly map to [0,1] via tanh(|z|/scale) (or tanh(z/scale) if signed)."""
+    z = _to_num(z)
+    if use_abs: z = z.abs()
     return np.tanh(z / float(scale))
 
+def squash_logistic(z: pd.Series, scale: float = 3.0, use_abs: bool = True) -> pd.Series:
+    """Logistic map to [0,1] with 0.5 near 0; steeper for smaller 'scale'."""
+    z = _to_num(z)
+    if use_abs: z = z.abs()
+    # center at 0; scale controls slope; clip for numerical stability
+    x = np.clip(z / float(scale), -20, 20)
+    return 1.0 / (1.0 + np.exp(-x))
+
+def squash_linear(z: pd.Series, scale: float = 3.0, use_abs: bool = True) -> pd.Series:
+    """Linear ramp: min(|z|/scale, 1). Simple and interpretable."""
+    z = _to_num(z)
+    if use_abs: z = z.abs()
+    return (z / float(scale)).clip(0.0, 1.0)
+
+_SQUASHERS = {
+    "tanh": squash_tanh,
+    "logistic": squash_logistic,
+    "linear": squash_linear,
+}
+
+# ---------------------------
+# Component computation
+# ---------------------------
 
 def compute_component_scores(
     df: pd.DataFrame,
-    z_cols: dict[str, str],
-    scale: float = 3.0,
-    prefix: str = ""
+    z_cols: Dict[str, str],
+    *,
+    scales: Optional[Dict[str, float]] = None,
+    methods: Optional[Dict[str, str]] = None,
+    polarity: Optional[Dict[str, int]] = None,
+    use_abs: Optional[Dict[str, bool]] = None,
+    component_prefix: str = "",
+    default_scale: float = 3.0,
+    default_method: str = "tanh",
+    default_use_abs: bool = True,
 ) -> pd.DataFrame:
     """
-    Create component scores (0-1) from z-score columns.
+    Build per-feature component scores in [0,1].
 
-    z_cols maps a short name to the actual column in df, e.g.:
-        {
-          "SC": "SC_z_score_session_cnt",
-          "SS": "SS_z_score_max",
-          "SL": "SL_z_score",
-          "ZB": "ZB_z_score",
-          "BU": "BU_z_score_bytes_usage",
-          "IDLE":"IDLE_z_idle",
-        }
+    Parameters
+    ----------
+    z_cols : mapping {component_name -> df_column_with_raw_signal}
+        e.g., {"ZB": "ZB_z_score", "IF": "if_raw_anom"}
+    scales : optional per-component scale (e.g., {"IF": 1.2})
+    methods : optional per-component squasher {"ZB":"tanh","IF":"logistic","BU":"linear"}
+    polarity : optional per-component polarity {name: +1|-1}
+        If -1, the signal is multiplied by -1 *before* abs/squash, useful if "higher is better".
+    use_abs : optional per-component flag to apply abs() before squashing (default True)
     """
     out = df.copy()
+    scales = scales or {}
+    methods = methods or {}
+    polarity = polarity or {}
+    use_abs = use_abs or {}
+
     for name, col in z_cols.items():
-        comp_col = f"{prefix}{name}_score"
-        out[comp_col] = squash_tanh(out[col]) if col in out.columns else 0.0
+        src = out[col] if col in out.columns else 0.0
+        p = int(polarity.get(name, +1))
+        src = _to_num(src) * p
+        method = methods.get(name, default_method)
+        scale = float(scales.get(name, default_scale))
+        ua = bool(use_abs.get(name, default_use_abs))
+
+        squasher = _SQUASHERS.get(method)
+        if squasher is None:
+            raise ValueError(f"Unknown squash method '{method}' for component '{name}'. "
+                             f"Valid: {list(_SQUASHERS.keys())}")
+
+        out[f"{component_prefix}{name}_score"] = squasher(src, scale=scale, use_abs=ua)
+
     return out
 
+# ---------------------------
+# Severity computation
+# ---------------------------
 
 def compute_severity(
     df: pd.DataFrame,
-    z_cols: dict[str, str],
-    weights: dict[str, float],
-    flag_cols: list[str] | None = None,
-    persistence_col: str | None = None,
-    scale: float = 3.0,
+    *,
+    z_cols: Dict[str, str],
+    weights: Dict[str, float],
+    # optional per-component knobs
+    scales: Optional[Dict[str, float]] = None,
+    methods: Optional[Dict[str, str]] = None,
+    polarity: Optional[Dict[str, int]] = None,
+    use_abs: Optional[Dict[str, bool]] = None,
+    component_prefix: str = "",
+    default_scale: float = 3.0,
+    default_method: str = "tanh",
+    default_use_abs: bool = True,
+    normalize_weights: bool = True,
+    # flags & persistence
+    flag_cols: Optional[List[str]] = None,
+    persistence_col: Optional[str] = None,
+    # blend coefficients
+    alpha_core: float = 0.85,
+    beta_flags: float = 0.10,
+    gamma_persist: float = 0.05,
+    # outputs
     severity_name: str = "Severity_final",
     label_name: str = "Severity_label",
-    label_bins: tuple[float, float] = (0.30, 0.70),
-    component_prefix: str = ""
+    label_bins: Tuple[float, float] = (0.30, 0.70),
+    return_components: bool = True,
 ) -> pd.DataFrame:
     """
-    1) Build per-feature component scores via tanh(|z|/scale).
-    2) Weighted blend -> Severity_S0
-    3) Optional boosts: flags (0/1) and persistence (0-1)
-    4) Clip to [0,1]; label Low/Medium/High.
+    Compute severity in [0,1] from engineered signals.
+
+    Works for:
+      - Gold layer: pass z_cols & weights only.
+      - Inference: pass same z_cols (+ optional model score), weights, and flag_cols.
+
+    Notes:
+      - weights can be auto-normalized.
+      - per-component scale, method, polarity, use_abs allow independent tuning later.
+      - flags are averaged over the PRESENT flag columns and added with beta_flags.
+      - persistence is expected in [0,1] (we coerce & clip).
     """
-    assert set(weights.keys()) == set(z_cols.keys()), \
-        "weights and z_cols must have identical keys"
+    # Validate keys
+    if set(weights.keys()) != set(z_cols.keys()):
+        raise AssertionError("weights and z_cols must have identical keys.")
 
-    out = compute_component_scores(df, z_cols=z_cols, scale=scale, prefix=component_prefix)
+    # Normalize weights (optional)
+    if normalize_weights:
+        s = sum(float(w) for w in weights.values())
+        s = s if s > 0 else 1.0
+        weights = {k: float(v) / s for k, v in weights.items()}
 
-    # Weighted blend of components -> S0
-    S0 = 0.0
+    # Component scores
+    out = compute_component_scores(
+        df,
+        z_cols=z_cols,
+        scales=scales,
+        methods=methods,
+        polarity=polarity,
+        use_abs=use_abs,
+        component_prefix=component_prefix,
+        default_scale=default_scale,
+        default_method=default_method,
+        default_use_abs=default_use_abs,
+    )
+
+    # Core blend -> Severity_S0
+    s0 = 0.0
     for name in z_cols.keys():
         comp_col = f"{component_prefix}{name}_score"
-        S0 = S0 + float(weights[name]) * out[comp_col].fillna(0.0)
-    out["Severity_S0"] = S0
+        s0 += float(weights[name]) * _to_num(out[comp_col])
+    out["Severity_S0"] = s0
 
-    # Optional flag boost (normalized)
+    # Flags (0/1), normalized by #present columns
     if flag_cols:
         present = [c for c in flag_cols if c in out.columns]
         if present:
-            B = out[present].fillna(0).sum(axis=1) / 3.0  # cap @1 later
+            denom = max(1, len(present))
+            B = out[present].apply(_to_num).sum(axis=1) / denom
             B = B.clip(0, 1)
         else:
             B = 0.0
     else:
         B = 0.0
 
-    # Optional persistence term (ideally already 0-1)
+    # Persistence in [0,1]
     if persistence_col and persistence_col in out.columns:
-        P = out[persistence_col].fillna(0.0)
+        P = _to_num(out[persistence_col]).clip(0, 1)
     else:
         P = 0.0
 
-    # Final severity (coeffs are tunable; start conservative)
-    out[severity_name] = np.clip(0.85 * out["Severity_S0"] + 0.10 * B + 0.05 * P, 0.0, 1.0)
+    # Final severity
+    sev = (alpha_core * out["Severity_S0"] +
+           beta_flags * B +
+           gamma_persist * P)
+    out[severity_name] = np.clip(_to_num(sev), 0.0, 1.0)
 
     # Labels
     lo, hi = label_bins
-    def _label(x: float) -> str:
-        if x < lo: return "Low"
-        if x < hi: return "Medium"
+    def _lab(v: float) -> str:
+        if v < lo: return "Low"
+        if v < hi: return "Medium"
         return "High"
+    out[label_name] = out[severity_name].apply(_lab)
 
-    out[label_name] = out[severity_name].apply(_label)
+    # Optionally drop component columns to keep output lean
+    if not return_components:
+        drop_cols = [c for c in out.columns if c.endswith("_score") and c.startswith(component_prefix)]
+        out = out.drop(columns=drop_cols, errors="ignore")
+
     return out
+    
+# ================================
+# GOLD-LAYER PLOTS (returns figs)
+# ================================
+from __future__ import annotations
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Optional, Tuple
 
-
-# =========================
-# 2) Plotting helpers
-# =========================
-
-def plot_severity_trend(
-    df: pd.DataFrame,
+# 1) Per-device: overall severity trend
+def plot_severity_trend_gold(
+    df_sev: pd.DataFrame,
     device_id_val,
     date_col: str = "date",
     severity_col: str = "Severity_final",
     title: str | None = None
-) -> None:
+) -> Optional[plt.Figure]:
     """
-    Single-device severity trend over time (matplotlib only).
+    Build and return a Figure showing severity (0–1) over time for one device.
+    Returns None if the device has no rows.
     """
-    dd = df[df.get("device_id") == device_id_val].copy()
+    dd = df_sev[df_sev.get("device_id") == device_id_val].copy()
     if dd.empty:
-        raise ValueError(f"No rows for device_id={device_id_val}")
+        return None
     dd = dd.sort_values(date_col)
     x = pd.to_datetime(dd[date_col])
-    y = dd[severity_col].astype(float)
+    y = pd.to_numeric(dd[severity_col], errors="coerce")
 
-    plt.figure(figsize=(10, 4))
-    plt.plot(x, y, marker="o")
-    plt.title(title or f"Severity trend | device_id={device_id_val}")
-    plt.xlabel(date_col)
-    plt.ylabel(severity_col)
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(x, y, marker="o", linewidth=2)
+    ax.axhline(0.3, linestyle="--", linewidth=1)
+    ax.axhline(0.7, linestyle="--", linewidth=1)
+    ax.set_ylim(0, 1)
+    ax.set_title(title or f"Severity trend (Gold) | device_id={device_id_val}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Severity (0–1)")
+    ax.grid(True)
+    fig.tight_layout()
+    return fig
 
 
-def plot_component_trend(
-    df: pd.DataFrame,
+# 2) Per-device: component score trends (from z-scores)
+def plot_component_trend_gold(
+    df_sev: pd.DataFrame,
     device_id_val,
     component_cols: list[str],
     date_col: str = "date",
     title: str | None = None
-) -> None:
+) -> Optional[plt.Figure]:
     """
-    Multiple component score lines (0-1) for one device across time.
+    Build and return a Figure with multiple component score lines (0–1) for one device.
+    Returns None if the device has no rows.
     """
-    dd = df[df.get("device_id") == device_id_val].copy()
+    dd = df_sev[df_sev.get("device_id") == device_id_val].copy()
     if dd.empty:
-        raise ValueError(f"No rows for device_id={device_id_val}")
+        return None
     dd = dd.sort_values(date_col)
     x = pd.to_datetime(dd[date_col])
 
-    plt.figure(figsize=(10, 4))
+    fig, ax = plt.subplots(figsize=(10, 4))
     for c in component_cols:
         if c in dd.columns:
-            plt.plot(x, dd[c].astype(float), marker="o", label=c)
-    plt.title(title or f"Component scores | device_id={device_id_val}")
-    plt.xlabel(date_col)
-    plt.ylabel("component score (0–1)")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+            ax.plot(x, pd.to_numeric(dd[c], errors="coerce"), marker="o", label=c)
+    ax.set_ylim(0, 1)
+    ax.set_title(title or f"Component scores (Gold) | device_id={device_id_val}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Component score (0–1)")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    return fig
 
-import pandas as pd
-import matplotlib.pyplot as plt
 
-def daily_anomaly_device_counts(df: pd.DataFrame,
-                                date_col: str = "date",
-                                device_col: str = "device_id",
-                                flag_col: str = "anomaly",
-                                rolling_days: int | None = 7) -> pd.DataFrame:
+# 3) Fleet: daily count of devices above a severity threshold
+def plot_daily_severe_device_counts_gold(
+    df_sev: pd.DataFrame,
+    date_col: str = "date",
+    device_col: str = "device_id",
+    severity_col: str = "Severity_final",
+    threshold: float = 0.7,
+    rolling_days: int = 7
+) -> Tuple[plt.Figure, pd.DataFrame]:
     """
-    Returns a DataFrame with columns: [date, devices_flagged, devices_flagged_rolling]
-    Counts UNIQUE devices per day where df[flag_col] == 1.
+    Compute daily counts of UNIQUE devices with severity >= threshold and
+    return (Figure, counts_df).
+
+    counts_df columns: [date, devices_severe, devices_severe_rolling?]
     """
-    dd = df.copy()
-    dd[date_col] = pd.to_datetime(dd[date_col])
-    # keep rows that are flagged
-    dd = dd[dd[flag_col] == 1]
-
-    # unique devices per day
-    out = (dd.drop_duplicates([date_col, device_col])
-             .groupby(date_col)[device_col]
-             .nunique()
-             .rename("devices_flagged")
-             .reset_index()
-           )
-
-    if rolling_days:
-        out["devices_flagged_rolling"] = (
-            out["devices_flagged"].rolling(rolling_days, min_periods=1).mean()
-        )
-    return out
-
-def plot_daily_anomaly_device_counts(counts_df: pd.DataFrame,
-                                     date_col: str = "date",
-                                     value_col: str = "devices_flagged",
-                                     rolling_col: str | None = "devices_flagged_rolling",
-                                     title: str = "Daily devices flagged as anomaly") -> None:
-    x = pd.to_datetime(counts_df[date_col])
-    y = counts_df[value_col].astype(float)
-
-    plt.figure(figsize=(10,4))
-    plt.plot(x, y, marker="o", label=value_col)
-    if rolling_col and rolling_col in counts_df.columns:
-        plt.plot(x, counts_df[rolling_col].astype(float), marker="o", label=rolling_col)
-    plt.title(title)
-    plt.xlabel(date_col)
-    plt.ylabel("unique devices")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-# Example:
-# counts = daily_anomaly_device_counts(df, date_col="date", device_col="device_id", flag_col="anomaly", rolling_days=7)
-# plot_daily_anomaly_device_counts(counts)
-
-def daily_severe_device_counts(df: pd.DataFrame,
-                               date_col: str = "date",
-                               device_col: str = "device_id",
-                               severity_col: str = "Severity_final",
-                               threshold: float = 0.7,
-                               rolling_days: int | None = 7) -> pd.DataFrame:
-    """
-    Returns a DataFrame with columns: [date, devices_severe, devices_severe_rolling]
-    Counts UNIQUE devices per day whose severity >= threshold.
-    """
-    dd = df.copy()
+    dd = df_sev.copy()
     dd[date_col] = pd.to_datetime(dd[date_col])
     dd = dd[pd.to_numeric(dd[severity_col], errors="coerce") >= threshold]
 
     out = (dd.drop_duplicates([date_col, device_col])
-             .groupby(date_col)[device_col]
+             .groupby(date_col, as_index=False)[device_col]
              .nunique()
-             .rename("devices_severe")
-             .reset_index()
-           )
+             .rename(columns={device_col: "devices_severe"}))
 
     if rolling_days:
         out["devices_severe_rolling"] = (
             out["devices_severe"].rolling(rolling_days, min_periods=1).mean()
         )
-    return out
 
-def plot_daily_severe_device_counts(counts_df: pd.DataFrame,
-                                    date_col: str = "date",
-                                    value_col: str = "devices_severe",
-                                    rolling_col: str | None = "devices_severe_rolling",
-                                    title: str = "Daily devices above severity threshold") -> None:
-    x = pd.to_datetime(counts_df[date_col])
-    y = counts_df[value_col].astype(float)
+    x = pd.to_datetime(out[date_col])
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(x, out["devices_severe"], marker="o", label="Daily devices ≥ threshold")
+    if "devices_severe_rolling" in out.columns:
+        ax.plot(x, out["devices_severe_rolling"], marker="o", label=f"{rolling_days}-day rolling mean")
+    ax.set_title(f"Daily devices with Severity ≥ {threshold} (Gold)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Unique devices")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    return fig, out
 
-    plt.figure(figsize=(10,4))
-    plt.plot(x, y, marker="o", label=value_col)
-    if rolling_col and rolling_col in counts_df.columns:
-        plt.plot(x, counts_df[rolling_col].astype(float), marker="o", label=rolling_col)
-    plt.title(title)
-    plt.xlabel(date_col)
-    plt.ylabel("unique devices")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
 
-# Example:
-# severe_counts = daily_severe_device_counts(df_out, date_col="date", device_col="device_id",
-#                                            severity_col="Severity_final", threshold=0.7, rolling_days=7)
-# plot_daily_severe_device_counts(severe_counts)
+# 4) Fleet: daily count of devices with ANY statistical anomaly flag (Gold-only)
+def plot_daily_stat_anomaly_counts_gold(
+    df_sev: pd.DataFrame,
+    z_cols_map: dict[str, str],
+    date_col: str = "date",
+    device_col: str = "device_id",
+    z_threshold: float = 3.0,
+    rolling_days: int = 7
+) -> Tuple[Optional[plt.Figure], Optional[pd.DataFrame]]:
+    """
+    Build a composite statistical flag per row: 1 if ANY |z| >= z_threshold.
+    Then compute daily UNIQUE device counts where the flag == 1.
+
+    Returns (Figure, counts_df). If no z-score columns are present, returns (None, None).
+    """
+    dd = df_sev.copy()
+    dd[date_col] = pd.to_datetime(dd[date_col])
+
+    # Build statistical flag (ANY |z| >= threshold)
+    present_cols = [c for c in z_cols_map.values() if c in dd.columns]
+    if not present_cols:
+        return None, None
+
+    Z = dd[present_cols].apply(pd.to_numeric, errors="coerce").abs()
+    dd["__stat_is_anom__"] = (Z.ge(z_threshold).any(axis=1)).astype(int)
+
+    flagged = dd[dd["__stat_is_anom__"] == 1]
+    out = (flagged.drop_duplicates([date_col, device_col])
+                   .groupby(date_col, as_index=False)[device_col]
+                   .nunique()
+                   .rename(columns={device_col: "devices_flagged"}))
+
+    if rolling_days:
+        out["devices_flagged_rolling"] = (
+            out["devices_flagged"].rolling(rolling_days, min_periods=1).mean()
+        )
+
+    x = pd.to_datetime(out[date_col])
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(x, out["devices_flagged"], marker="o", label="Daily devices (|z|≥thr)")
+    if "devices_flagged_rolling" in out.columns:
+        ax.plot(x, out["devices_flagged_rolling"], marker="o", label=f"{rolling_days}-day rolling mean")
+    ax.set_title(f"Daily devices flagged by statistical rule |z| ≥ {z_threshold} (Gold)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Unique devices")
+    ax.grid(True)
+    ax.legend()
+    fig.tight_layout()
+    return fig, out
+# =====================================
+# AAA Severity Configuration
+# =====================================
+
+# ---------- COMPUTE ----------
+severity:
+  tanh_scale: 3.0               # scale for tanh(|z|/scale)
+  label_bins: [0.30, 0.70]      # thresholds for Low/Medium/High severity
+  normalize_weights: true       # normalize weights automatically
+
+# ---------- FEATURE MAPPING ----------
+z_cols:
+  SC: SC_z_score_session_cnt
+  SS: SS_z_score_max
+  SL: SL_z_score
+  ZB: ZB_z_score
+  BU: BU_z_score_bytes_usage
+  IDLE: IDLE_z_idle
+
+# ---------- WEIGHTS ----------
+weights:
+  SC: 0.15
+  SS: 0.15
+  SL: 0.20
+  ZB: 0.20
+  BU: 0.15
+  IDLE: 0.15
+
+# ---------- FLAGS ----------
+# For inference module, use these (ignored in Gold)
+flag_cols:
+  - anomaly
+  - shortSessionAnomaly
+  - ZerobytesUsagenAnomaly
+
+# ---------- PERSISTENCE ----------
+persistence_col: null
+
+# ---------- PLOTTING ----------
+plotting:
+  do_plots: true
+  severity_threshold: 0.7
+  rolling_days: 7
+
+# to integrate model-specific weights or AE configs
+inference:
+  include_model_score: true
+  model_score_col: iforest_score
+  model_weight: 0.08
+
 
 # =========================================
-# severity_handler.py (drop-in handler)
+# severity_handler.py
 # =========================================
 from __future__ import annotations
 import pandas as pd
+import yaml
+from pathlib import Path
 
-from severity_metric import (
-    compute_severity,
-    plot_severity_trend,
-    plot_component_trend,
-    daily_anomaly_device_counts,
-    plot_daily_anomaly_device_counts,
-    daily_severe_device_counts,
-    plot_daily_severe_device_counts,
-)
+from severity.severity_metric import compute_severity
+
 
 def run_severity_handler(
     df: pd.DataFrame,
-    # --- column mapping ---
+    config_path: str | None = None,
+    # Manual overrides (take priority over config)
     z_cols: dict | None = None,
     weights: dict | None = None,
-    flag_cols: list[str] | None = None,      # e.g., ["anomaly", "shortSessionAnomaly","ZerobytesUsagenAnomaly"]
-    persistence_col: str | None = None,      # e.g., "recent_anomaly_rate"
-    # --- identifiers & fields ---
+    flag_cols: list[str] | None = None,
+    persistence_col: str | None = None,
     date_col: str = "date",
     device_col: str = "device_id",
     severity_col: str = "Severity_final",
     label_col: str = "Severity_label",
-    # --- plotting control ---
-    device_id_to_plot=None,                  # if None, picks first found
-    severity_threshold: float = 0.7,         # used in fleet severity plot
-    rolling_days: int = 7,                   # smoothing window for fleet plots
-    do_plots: bool = True,
-    # --- compute options ---
-    tanh_scale: float = 3.0,
-    label_bins: tuple[float, float] = (0.30, 0.70),
-    # --- output ---
+    tanh_scale: float | None = None,
+    label_bins: tuple[float, float] | None = None,
+    do_plots: bool | None = None,
+    severity_threshold: float | None = None,
+    rolling_days: int | None = None,
     save_csv_path: str | None = None,
+    plotters: dict | None = None,  # pass plotting funcs from notebook
 ):
     """
-    End-to-end severity computation + visualization.
+    End-to-end severity computation & optional visualization.
 
-    Returns
-    -------
-    df_sev : pd.DataFrame           # original df + component scores + Severity_S0 + Severity_final + label
-    daily_anom : pd.DataFrame | None    # fleet trend from anomaly flags (if any flag column provided/existing)
-    daily_sev  : pd.DataFrame           # fleet trend from severity threshold
+    Loads config automatically if config_path provided.
+    Returns: (df_sev, daily_anom, daily_sev)
     """
 
-    # Defaults for z_cols / weights if not supplied
-    if z_cols is None:
-        z_cols = {
-            "SC":  "SC_z_score_session_cnt",
-            "SS":  "SS_z_score_max",
-            "SL":  "SL_z_score",
-            "ZB":  "ZB_z_score",
-            "BU":  "BU_z_score_bytes_usage",
-            "IDLE":"IDLE_z_idle",
-        }
-    if weights is None:
-        weights = {"SC":0.15, "SS":0.15, "SL":0.20, "ZB":0.20, "BU":0.15, "IDLE":0.15}
+    # ==============================
+    # 1) Load configuration
+    # ==============================
+    cfg = {}
+    if config_path and Path(config_path).exists():
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
 
-    # --- 1) Compute severity (row-wise)
+    # Defaults fall back to config
+    z_cols = z_cols or cfg.get("z_cols", {})
+    weights = weights or cfg.get("weights", {})
+    flag_cols = flag_cols or cfg.get("flag_cols", None)
+    persistence_col = persistence_col or cfg.get("persistence_col", None)
+
+    severity_cfg = cfg.get("severity", {})
+    tanh_scale = tanh_scale or severity_cfg.get("tanh_scale", 3.0)
+    label_bins = label_bins or tuple(severity_cfg.get("label_bins", [0.3, 0.7]))
+
+    plot_cfg = cfg.get("plotting", {})
+    do_plots = do_plots if do_plots is not None else plot_cfg.get("do_plots", True)
+    severity_threshold = severity_threshold or plot_cfg.get("severity_threshold", 0.7)
+    rolling_days = rolling_days or plot_cfg.get("rolling_days", 7)
+
+    # ==============================
+    # 2) Compute Severity
+    # ==============================
     df_sev = compute_severity(
         df=df,
         z_cols=z_cols,
         weights=weights,
-        flag_cols=flag_cols,              # None in Gold; list in Inference to include model flags
-        persistence_col=persistence_col,  # None unless you compute a recent rate
+        flag_cols=flag_cols,
+        persistence_col=persistence_col,
         scale=tanh_scale,
         severity_name=severity_col,
         label_name=label_col,
         label_bins=label_bins,
     )
 
-    # --- 2) Per-device plots
-    if do_plots and not df_sev.empty:
-        # choose a device to plot
-        dev = device_id_to_plot
-        if dev is None and device_col in df_sev.columns:
-            dev = df_sev[device_col].iloc[0]
+    # ==============================
+    # 3) Optional plotting
+    # ==============================
+    daily_anom, daily_sev = None, None
+    if do_plots and plotters:
+        # Unpack plotting functions
+        ps = plotters
+        device_id_to_plot = df_sev[device_col].iloc[0] if device_col in df_sev.columns else None
 
-        if dev is not None:
-            # Overall severity trend
-            plot_severity_trend(
-                df_sev.rename(columns={device_col: "device_id", date_col: "date"}),
-                device_id_val=dev,
-                date_col="date",
-                severity_col=severity_col,
-                title=f"Severity trend | {device_col}={dev}",
-            )
-
-            # Component trend
+        if "plot_severity_trend" in ps:
+            ps["plot_severity_trend"](df_sev, device_id_to_plot, date_col=date_col, severity_col=severity_col)
+        if "plot_component_trend" in ps:
             comp_cols = [f"{k}_score" for k in z_cols.keys()]
-            plot_component_trend(
-                df_sev.rename(columns={device_col: "device_id", date_col: "date"}),
-                device_id_val=dev,
-                component_cols=comp_cols,
-                date_col="date",
-                title=f"Component scores | {device_col}={dev}",
-            )
+            ps["plot_component_trend"](df_sev, device_id_to_plot, component_cols=comp_cols, date_col=date_col)
+        if "daily_anomaly_device_counts" in ps and flag_cols:
+            daily_anom = ps["daily_anomaly_device_counts"](df_sev, date_col, device_col, flag_cols[0])
+            if "plot_daily_anomaly_device_counts" in ps:
+                ps["plot_daily_anomaly_device_counts"](daily_anom)
+        if "daily_severe_device_counts" in ps:
+            daily_sev = ps["daily_severe_device_counts"](df_sev, date_col, device_col, severity_col, severity_threshold)
+            if "plot_daily_severe_device_counts" in ps:
+                ps["plot_daily_severe_device_counts"](daily_sev)
 
-    # --- 3) Fleet-level plots (daily counts)
-    daily_anom = None
-    # 3a) anomaly-flag-based trend (only if a flag column was provided and exists)
-    if do_plots and flag_cols:
-        # build a composite flag OR just use one column — here we use OR over provided flags
-        present_flags = [c for c in flag_cols if c in df_sev.columns]
-        if present_flags:
-            tmp = df_sev.copy()
-            tmp["__is_anomalous__"] = (tmp[present_flags].fillna(0).sum(axis=1) > 0).astype(int)
-
-            daily_anom = daily_anomaly_device_counts(
-                tmp.rename(columns={date_col: "date", device_col: "device_id"}),
-                date_col="date",
-                device_col="device_id",
-                flag_col="__is_anomalous__",
-                rolling_days=rolling_days,
-            )
-            plot_daily_anomaly_device_counts(daily_anom)
-
-    # 3b) severity-threshold trend (always available)
-    daily_sev = daily_severe_device_counts(
-        df_sev.rename(columns={date_col: "date", device_col: "device_id"}),
-        date_col="date",
-        device_col="device_id",
-        severity_col=severity_col,
-        threshold=severity_threshold,
-        rolling_days=rolling_days,
-    )
-    if do_plots:
-        plot_daily_severe_device_counts(daily_sev)
-
-    # --- 4) Optional save
+    # ==============================
+    # 4) Optional save
+    # ==============================
     if save_csv_path:
         df_sev.to_csv(save_csv_path, index=False)
 
     return df_sev, daily_anom, daily_sev
-
-
-# ---------------------------
-# Example usage (uncomment):
-# ---------------------------
-# df = ...  # your Gold or Inference DataFrame
-# df_sev, daily_anom, daily_sev = run_severity_handler(
-#     df=df,
-#     flag_cols=None,              # Gold: None | Inference: ["anomaly","shortSessionAnomaly","ZerobytesUsagenAnomaly"]
-#     device_id_to_plot=None,      # or a specific device id
-#     severity_threshold=0.7,
-#     rolling_days=7,
-#     do_plots=True,
-#     save_csv_path=None,
-# )
