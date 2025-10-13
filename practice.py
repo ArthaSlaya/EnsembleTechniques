@@ -2392,3 +2392,52 @@ def run_severity_handler(
         "daily_sev": daily_sev,
         "figs": figs or None,
     }
+    
+# ======================================
+# 1️⃣ Imports
+# ======================================
+from severity.severity_handler import run_severity_handler
+from severity.plots import (
+    plot_severity_trend_gold,
+    plot_component_trend_gold,
+    plot_daily_severe_device_counts_gold,
+    plot_daily_stat_anomaly_counts_gold,
+)
+
+# ======================================
+# 2️⃣ Define plotting functions dictionary
+# ======================================
+plotters = {
+    "plot_severity_trend_gold": plot_severity_trend_gold,
+    "plot_component_trend_gold": plot_component_trend_gold,
+    "plot_daily_severe_device_counts_gold": plot_daily_severe_device_counts_gold,
+    "plot_daily_stat_anomaly_counts_gold": plot_daily_stat_anomaly_counts_gold,
+}
+
+# ======================================
+# 3️⃣ Run handler
+# ======================================
+results = run_severity_handler(
+    df=df_gold,   # your DataFrame after Gold-layer preprocessing
+    config_path="severity/severity_config.yaml",
+    plotters=plotters,
+    do_plots=True,         # 👈 ensures figures are created
+    return_figs=True,      # 👈 ensures figures are returned to notebook
+    save_csv_path=None,    # 👈 disables saving to disk
+)
+
+# ======================================
+# 4️⃣ Access results
+# ======================================
+df_sev = results["df_sev"]
+daily_anom = results["daily_anom"]
+daily_sev = results["daily_sev"]
+figs = results["figs"]
+
+# ======================================
+# 5️⃣ Display figures inline
+# ======================================
+for name, fig in (figs or {}).items():
+    if fig:
+        print(f"▶ Showing figure: {name}")
+        fig.show()
