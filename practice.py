@@ -19,7 +19,16 @@ for k, col in z_cols.items():
               f"all_zero={bool((s.fillna(0)==0).all())}, "
               f"mean={s.mean():.3f}, std={s.std():.3f}")
 
+# --- Quick diagnostic check ---
+print("\n--- Severity_S0 ---")
+print(df_sev["Severity_S0"].describe(percentiles=[.5, .9, .99]))
 
+print("\n--- Severity_final ---")
+print(df_sev["Severity_final"].describe(percentiles=[.5, .9, .99]))
+
+thr = 0.7
+count_thr = (pd.to_numeric(df_sev["Severity_final"], errors="coerce") >= thr).sum()
+print(f"\nRows >= {thr}: {count_thr}")
 # ============================================================================
 # dip-ingestion-platform/mod-ml/aaa-inferencing-lambda/lambda_function.py
 # ============================================================================
