@@ -1,32 +1,84 @@
-# 1) What columns did we map?
+# 0) Make sure we’re using the *current* modules
+from importlib import reload
+import aaa.exp.severity.severity_metric as sm
+import aaa.exp.severity.severity_handler as sh
+reload(sm); reload(sh)
+
+import inspect
+print("severity_metric source:", inspect.getsourcefile(sm))
+print("handler source:", inspect.getsourcefile(sh))
+print("compute_severity signature:", inspect.signature(sm.compute_severity))
+
+# 1) What _score columns actually exist?
+score_cols = [c for c in df_sev.columns if c.endswith("_score")]
+print("Found score cols:", score_cols[:20], " ... total:", len(score_cols))
+
+# 2) If you mapped these components:
 z_cols = {
-    "SC":  "SC_z_score_session_cnt",
-    "SS":  "SS_z_score_max",
-    "SL":  "SL_z_score",
-    "ZB":  "ZB_z_score",
-    "BU":  "BU_z_score_bytes_usage",
-    "IDLE":"IDLE_z_idle",
+    "SC": "SC_z_score_session_cnt",
+    "SS": "SS_z_score_max",
+    "SL": "SL_z_score",
+    "ZB": "ZB_z_score",
+    "BU": "BU_z_score_bytes_usage",
+    "IDLE": "IDLE_z_idle",
 }
 
-print("Mapped z cols ->")
-for k,v in z_cols.items():
-    print(f"  {k:5s} -> {v}  | present={v in df.columns}")
+# Build the expected names & compare to what’s present
+expected = [f"{k}_score" for k in z_cols.keys()]
+present  = [c for c in expected if c in df_sev.columns]
+missing  = [c for c in expected if c not in df_sev.columns]
+print("Expected:", expected)
+print("Present :", present)
+print("Missing :", missing)
 
-# 2) Which are missing?
-missing = [v for v in z_cols.values() if v not in df.columns]
-print("\nMissing:", missing)
-
-# 3) Basic stats for present ones (so we see if they’re all NaN/0)
-present = [v for v in z_cols.values() if v in df.columns]
+# 3) Only index the ones that exist (avoids KeyError)
 if present:
-    print("\nPresent columns describe():")
-    print(df[present].apply(pd.to_numeric, errors="coerce").describe(include='all'))
+    print("Non-zero counts per component:",
+          (df_sev[present] != 0).sum().to_dict())
+else:
+    print("No component *_score columns present — likely a stale import. Reload/restart and rerun compute_severity.")
 
-# 4) After compute, check component scores to see which are zero
-if 'Severity_S0' in df_sev.columns:
-    comp_cols = [f"{k}_score" for k in z_cols.keys()]
-    print("\nComponent non-zero counts:")
-    print((df_sev[comp_cols] != 0).sum())
+print("\n--- z-cols sanity ---")
+print(df_sev[list(z_cols.values())].apply(pd.to_numeric, errors="coerce")
+                                  .describe(percentiles=[.5, .9, .99]))
+print("\n--- severity ---")
+print(df_sev["Severity_S0"].describe(percentiles=[.5, .9, .99]))
+print(df_sev["Severity_final"].describe(percentiles=[.5, .9, .99]))
+thr = 0.7
+print("rows >= 0.7:", (pd.to_numeric(df_sev["Severity_final"], errors="coerce") >= thr).sum())
+
+# 1) Ensure component scores exist
+expected = [f"{k}_score" for k in z_cols.keys()]
+present  = [c for c in expected if c in df_sev.columns]
+missing  = [c for c in expected if c not in df_sev.columns]
+if missing:
+    print("⚠️ Missing component score columns:", missing)
+    print("Plots would be empty/flat until these exist.")
+else:
+    print("✅ All component score columns present.")
+
+# 2) Ensure severity has signal
+sev_max = pd.to_numeric(df_sev["Severity_final"], errors="coerce").max()
+if not np.isfinite(sev_max) or sev_max <= 0:
+    print("⚠️ Severity_final is all zeros/NaN — plots will look empty.")
+else:
+    print(f"✅ Severity_final has signal. max={sev_max:.3f}")
+
+# 3) Bail out of plotting gracefully if no signal
+if missing or (not np.isfinite(sev_max) or sev_max <= 0):
+    # skip plotting to avoid empty charts
+    pass
+else:
+    # safe to show figures
+    for name, fig in (figs or {}).items():
+        if fig:
+            print(f"Showing: {name}")
+            fig.show()
+
+from importlib import reload
+import aaa.exp.severity.severity_metric as sm
+import aaa.exp.severity.severity_handler as sh
+reload(sm); reload(sh)
 # ============================================================================
 # dip-ingestion-platform/mod-ml/aaa-inferencing-lambda/lambda_function.py
 # ============================================================================
