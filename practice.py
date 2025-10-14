@@ -2231,80 +2231,50 @@ inference:
 
 # severity/severity_handler.py
 from __future__ import annotations
-import pandas as pd
-import yaml
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+import yaml
+import pandas as pd
 
-# If this file is in the same package, prefer relative import:
-from .severity_metric import compute_severity
-
-def _compute_daily_anomaly_counts(df: pd.DataFrame,
-                                  date_col: str, device_col: str,
-                                  flag_cols: list[str]) -> pd.DataFrame | None:
-    present_flags = [c for c in (flag_cols or []) if c in df.columns]
-    if not present_flags:
-        return None
-    tmp = df.copy()
-    tmp["__is_anomalous__"] = (tmp[present_flags].fillna(0).sum(axis=1) > 0).astype(int)
-    dd = tmp.rename(columns={date_col: "date", device_col: "device_id"}).copy()
-    dd["date"] = pd.to_datetime(dd["date"])
-    flagged = dd[dd["__is_anomalous__"] == 1]
-    out = (
-        flagged.drop_duplicates(["date", "device_id"])
-               .groupby("date", as_index=False)["device_id"]
-               .nunique()
-               .rename(columns={"device_id": "devices_flagged"})
-    )
-    return out
-
-def _compute_daily_severity_counts(df: pd.DataFrame,
-                                   date_col: str, device_col: str,
-                                   severity_col: str, threshold: float) -> pd.DataFrame:
-    dd = df.rename(columns={date_col: "date", device_col: "device_id"}).copy()
-    dd["date"] = pd.to_datetime(dd["date"])
-    sev_mask = pd.to_numeric(dd[severity_col], errors="coerce") >= threshold
-    severe = dd[sev_mask]
-    out = (
-        severe.drop_duplicates(["date", "device_id"])
-              .groupby("date", as_index=False)["device_id"]
-              .nunique()
-              .rename(columns={"device_id": "devices_severe"})
-    )
-    return out
+from severity.severity_metric import compute_severity
 
 def run_severity_handler(
     df: pd.DataFrame,
     config_path: str | None = None,
-    # Manual overrides (take priority over config)
+    # overrides (take priority over config)
     z_cols: dict | None = None,
     weights: dict | None = None,
     flag_cols: list[str] | None = None,
     persistence_col: str | None = None,
+    # id fields / names
     date_col: str = "date",
     device_col: str = "device_id",
     severity_col: str = "Severity_final",
     label_col: str = "Severity_label",
+    # compute knobs
     tanh_scale: float | None = None,
     label_bins: tuple[float, float] | None = None,
+    # plotting knobs
     do_plots: bool | None = None,
+    return_figs: bool = False,          # <— NEW
     severity_threshold: float | None = None,
     rolling_days: int | None = None,
-    save_csv_path: str | None = None,
-    plotters: dict | None = None,  # funcs that RETURN figures
-    return_figs: bool = True,
-) -> Dict[str, Any]:
+    plotters: dict | None = None,       # dict of plotting functions
+):
     """
-    Compute severity and (optionally) build figures via injected plotting functions.
-    Returns:
+    Compute severity from Gold/Inference features and optionally generate plots.
+
+    Returns a dict:
       {
-        "df_sev": DataFrame,
-        "daily_anom": DataFrame | None,
-        "daily_sev": DataFrame,
-        "figs": {optional dict of figures}
+        "df_sev": <DataFrame>,
+        "daily_anom": <DataFrame | None>,
+        "daily_sev": <DataFrame>,
+        "figs": {"severity_trend": fig, "component_trend": fig,
+                 "daily_sev": fig, "daily_stat": fig_or_None}  # only if return_figs=True
       }
     """
+    # -----------------
     # 1) Load config
+    # -----------------
     cfg = {}
     if config_path and Path(config_path).exists():
         with open(config_path, "r") as f:
@@ -2317,96 +2287,91 @@ def run_severity_handler(
 
     severity_cfg = cfg.get("severity", {})
     tanh_scale = tanh_scale if tanh_scale is not None else severity_cfg.get("tanh_scale", 3.0)
-    label_bins = label_bins or tuple(severity_cfg.get("label_bins", [0.3, 0.7]))
+    lb = severity_cfg.get("label_bins", [0.30, 0.70])
+    label_bins = label_bins or (float(lb[0]), float(lb[1]))
 
     plot_cfg = cfg.get("plotting", {})
-    do_plots = do_plots if do_plots is not None else plot_cfg.get("do_plots", True)
-    severity_threshold = severity_threshold if severity_threshold is not None else plot_cfg.get("severity_threshold", 0.7)
-    rolling_days = rolling_days if rolling_days is not None else plot_cfg.get("rolling_days", 7)
+    if do_plots is None:
+        do_plots = bool(plot_cfg.get("do_plots", True))
+    severity_threshold = (severity_threshold
+                          if severity_threshold is not None
+                          else float(plot_cfg.get("severity_threshold", 0.7)))
+    rolling_days = (rolling_days
+                    if rolling_days is not None
+                    else int(plot_cfg.get("rolling_days", 7)))
 
-    # 2) Compute Severity  (NOTE: pass default_scale, not scale)
+    # -----------------
+    # 2) Compute
+    # -----------------
     df_sev = compute_severity(
         df=df,
         z_cols=z_cols,
         weights=weights,
         flag_cols=flag_cols,
         persistence_col=persistence_col,
-        default_scale=tanh_scale,     # <-- fixed name
+        scale=tanh_scale,
         severity_name=severity_col,
         label_name=label_col,
         label_bins=label_bins,
     )
 
-    # 3) Always compute daily summaries
-    daily_anom = _compute_daily_anomaly_counts(df_sev, date_col, device_col, flag_cols or [])
-    daily_sev = _compute_daily_severity_counts(df_sev, date_col, device_col, severity_col, severity_threshold)
-    if rolling_days and "devices_severe" in (daily_sev.columns if daily_sev is not None else []):
-        daily_sev["devices_severe_rolling"] = daily_sev["devices_severe"].rolling(rolling_days, min_periods=1).mean()
-    if rolling_days and daily_anom is not None and "devices_flagged" in daily_anom.columns:
-        daily_anom["devices_flagged_rolling"] = daily_anom["devices_flagged"].rolling(rolling_days, min_periods=1).mean()
+    results: dict = {"df_sev": df_sev, "daily_anom": None, "daily_sev": None, "figs": {}}
 
-    # 4) Optional figures (return, don’t show)
-    figs: Dict[str, Any] = {}
-    if do_plots and plotters and return_figs:
-        # support either generic names or *_gold names
-        ps = {
-            "plot_severity_trend": plotters.get("plot_severity_trend") or plotters.get("plot_severity_trend_gold"),
-            "plot_component_trend": plotters.get("plot_component_trend") or plotters.get("plot_component_trend_gold"),
-            "plot_daily_severe_device_counts": plotters.get("plot_daily_severe_device_counts") or plotters.get("plot_daily_severe_device_counts_gold"),
-            "plot_daily_anomaly_device_counts": plotters.get("plot_daily_anomaly_device_counts"),  # if you have a generic one
-            "plot_daily_stat_anomaly_counts": plotters.get("plot_daily_stat_anomaly_counts_gold"), # optional
-        }
+    # -----------------
+    # 3) Plots (optional)
+    # -----------------
+    if do_plots and plotters:
+        # pick a device to plot
+        device_id_to_plot = df_sev[device_col].iloc[0] if device_col in df_sev.columns and not df_sev.empty else None
 
-        dev = df_sev[device_col].iloc[0] if device_col in df_sev.columns and not df_sev.empty else None
-        comp_cols = [f"{k}_score" for k in z_cols.keys()]
-
-        if dev and ps["plot_severity_trend"]:
-            figs["device_severity_trend"] = ps["plot_severity_trend"](
-                df_sev, device_id_val=dev, date_col=date_col, severity_col=severity_col
+        # per-device severity trend
+        if "plot_severity_trend_gold" in plotters and device_id_to_plot is not None:
+            fig = plotters["plot_severity_trend_gold"](
+                df_sev, device_id_to_plot, date_col=date_col, severity_col=severity_col
             )
-        if dev and ps["plot_component_trend"]:
-            figs["device_component_trend"] = ps["plot_component_trend"](
-                df_sev, device_id_val=dev, component_cols=comp_cols, date_col=date_col
+            if return_figs and fig is not None:
+                results["figs"]["severity_trend"] = fig
+
+        # per-device component trends
+        if "plot_component_trend_gold" in plotters and device_id_to_plot is not None:
+            comp_cols = [f"{k}_score" for k in z_cols.keys()]
+            fig = plotters["plot_component_trend_gold"](
+                df_sev, device_id_to_plot, component_cols=comp_cols, date_col=date_col
             )
-        if ps["plot_daily_severe_device_counts"]:
-            fig_sev, _ = ps["plot_daily_severe_device_counts"](
+            if return_figs and fig is not None:
+                results["figs"]["component_trend"] = fig
+
+        # fleet: daily devices above severity threshold
+        if "plot_daily_severe_device_counts_gold" in plotters:
+            fig, daily_sev = plotters["plot_daily_severe_device_counts_gold"](
                 df_sev, date_col=date_col, device_col=device_col,
-                severity_col=severity_col, threshold=severity_threshold, rolling_days=rolling_days
+                severity_col=severity_col, threshold=severity_threshold,
+                rolling_days=rolling_days
             )
-            figs["fleet_daily_severe"] = fig_sev
-        # Optional: if you want a statistical anomaly fleet fig for Gold
-        if ps["plot_daily_stat_anomaly_counts"]:
-            z_map = cfg.get("z_cols", z_cols)  # use config map if present
-            fig_stat, _ = ps["plot_daily_stat_anomaly_counts"](
-                df_sev, z_cols_map=z_map, date_col=date_col, device_col=device_col, z_threshold=3.0, rolling_days=rolling_days
+            results["daily_sev"] = daily_sev
+            if return_figs and fig is not None:
+                results["figs"]["daily_sev"] = fig
+
+        # fleet: daily devices flagged by statistical rule (if you want this view)
+        if "plot_daily_stat_anomaly_counts_gold" in plotters and z_cols:
+            fig, daily_anom = plotters["plot_daily_stat_anomaly_counts_gold"](
+                df_sev, z_cols_map=z_cols, date_col=date_col, device_col=device_col,
+                z_threshold=3.0, rolling_days=rolling_days
             )
-            figs["fleet_daily_stat_anomaly"] = fig_stat
+            results["daily_anom"] = daily_anom
+            if return_figs and fig is not None:
+                results["figs"]["daily_stat"] = fig
 
-    # 5) Optional save
-    if save_csv_path:
-        df_sev.to_csv(save_csv_path, index=False)
-
-    return {
-        "df_sev": df_sev,
-        "daily_anom": daily_anom,
-        "daily_sev": daily_sev,
-        "figs": figs or None,
-    }
+    return results
     
-# ======================================
-# 1️⃣ Imports
-# ======================================
-from severity.severity_handler import run_severity_handler
-from severity.plots import (
+from src.aaa.exp.severity.severity_handler import run_severity_handler
+from src.aaa.exp.severity.severity_plots import (
     plot_severity_trend_gold,
     plot_component_trend_gold,
     plot_daily_severe_device_counts_gold,
     plot_daily_stat_anomaly_counts_gold,
 )
 
-# ======================================
-# 2️⃣ Define plotting functions dictionary
-# ======================================
 plotters = {
     "plot_severity_trend_gold": plot_severity_trend_gold,
     "plot_component_trend_gold": plot_component_trend_gold,
@@ -2414,30 +2379,21 @@ plotters = {
     "plot_daily_stat_anomaly_counts_gold": plot_daily_stat_anomaly_counts_gold,
 }
 
-# ======================================
-# 3️⃣ Run handler
-# ======================================
 results = run_severity_handler(
-    df=df_gold,   # your DataFrame after Gold-layer preprocessing
+    df=feat,                                    # your Gold-layer dataframe
     config_path="severity/severity_config.yaml",
     plotters=plotters,
-    do_plots=True,         # 👈 ensures figures are created
-    return_figs=True,      # 👈 ensures figures are returned to notebook
-    save_csv_path=None,    # 👈 disables saving to disk
+    do_plots=True,
+    return_figs=True,                            # <-- now supported
 )
 
-# ======================================
-# 4️⃣ Access results
-# ======================================
-df_sev = results["df_sev"]
-daily_anom = results["daily_anom"]
-daily_sev = results["daily_sev"]
-figs = results["figs"]
+df_sev   = results["df_sev"]
+daily_an = results["daily_anom"]
+daily_sv = results["daily_sev"]
+figs     = results["figs"]
 
-# ======================================
-# 5️⃣ Display figures inline
-# ======================================
+# show inline
 for name, fig in (figs or {}).items():
     if fig:
-        print(f"▶ Showing figure: {name}")
+        print(f"Showing: {name}")
         fig.show()
