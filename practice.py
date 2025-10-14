@@ -1,3 +1,25 @@
+# 1) Check which expected z-cols exist
+z_cols = {
+    "SC": "SC_z_score_session_cnt",
+    "SS": "SS_z_score_max",
+    "SL": "SL_z_score",
+    "ZB": "ZB_z_score",
+    "BU": "BU_z_score_bytes_usage",
+    "IDLE":"IDLE_z_idle",
+}
+
+missing = [c for c in z_cols.values() if c not in df_feat.columns]
+print("Missing z-cols:", missing)
+
+# Are there any NaNs / all zeros in those cols?
+for k, col in z_cols.items():
+    if col in df_feat.columns:
+        s = pd.to_numeric(df_feat[col], errors="coerce")
+        print(f"{col}: n={len(s)}, nonnull={s.notna().sum()}, "
+              f"all_zero={bool((s.fillna(0)==0).all())}, "
+              f"mean={s.mean():.3f}, std={s.std():.3f}")
+
+
 # ============================================================================
 # dip-ingestion-platform/mod-ml/aaa-inferencing-lambda/lambda_function.py
 # ============================================================================
