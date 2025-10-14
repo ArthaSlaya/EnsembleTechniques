@@ -1,34 +1,32 @@
-# 1) Check which expected z-cols exist
+# 1) What columns did we map?
 z_cols = {
-    "SC": "SC_z_score_session_cnt",
-    "SS": "SS_z_score_max",
-    "SL": "SL_z_score",
-    "ZB": "ZB_z_score",
-    "BU": "BU_z_score_bytes_usage",
+    "SC":  "SC_z_score_session_cnt",
+    "SS":  "SS_z_score_max",
+    "SL":  "SL_z_score",
+    "ZB":  "ZB_z_score",
+    "BU":  "BU_z_score_bytes_usage",
     "IDLE":"IDLE_z_idle",
 }
 
-missing = [c for c in z_cols.values() if c not in df_feat.columns]
-print("Missing z-cols:", missing)
+print("Mapped z cols ->")
+for k,v in z_cols.items():
+    print(f"  {k:5s} -> {v}  | present={v in df.columns}")
 
-# Are there any NaNs / all zeros in those cols?
-for k, col in z_cols.items():
-    if col in df_feat.columns:
-        s = pd.to_numeric(df_feat[col], errors="coerce")
-        print(f"{col}: n={len(s)}, nonnull={s.notna().sum()}, "
-              f"all_zero={bool((s.fillna(0)==0).all())}, "
-              f"mean={s.mean():.3f}, std={s.std():.3f}")
+# 2) Which are missing?
+missing = [v for v in z_cols.values() if v not in df.columns]
+print("\nMissing:", missing)
 
-# --- Quick diagnostic check ---
-print("\n--- Severity_S0 ---")
-print(df_sev["Severity_S0"].describe(percentiles=[.5, .9, .99]))
+# 3) Basic stats for present ones (so we see if they’re all NaN/0)
+present = [v for v in z_cols.values() if v in df.columns]
+if present:
+    print("\nPresent columns describe():")
+    print(df[present].apply(pd.to_numeric, errors="coerce").describe(include='all'))
 
-print("\n--- Severity_final ---")
-print(df_sev["Severity_final"].describe(percentiles=[.5, .9, .99]))
-
-thr = 0.7
-count_thr = (pd.to_numeric(df_sev["Severity_final"], errors="coerce") >= thr).sum()
-print(f"\nRows >= {thr}: {count_thr}")
+# 4) After compute, check component scores to see which are zero
+if 'Severity_S0' in df_sev.columns:
+    comp_cols = [f"{k}_score" for k in z_cols.keys()]
+    print("\nComponent non-zero counts:")
+    print((df_sev[comp_cols] != 0).sum())
 # ============================================================================
 # dip-ingestion-platform/mod-ml/aaa-inferencing-lambda/lambda_function.py
 # ============================================================================
