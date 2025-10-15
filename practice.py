@@ -37,6 +37,12 @@ def _debug_severity_state(
             print(f"[SEV][dbg] label value counts:\n{out[label_name].value_counts(dropna=False).to_string()}")
     except Exception as e:
         print(f"[SEV][dbg] (error while debugging): {e}")
+        
+if debug:
+    _debug_severity_state(out, z_cols, component_prefix, severity_name, label_name, note="after components")
+    
+if debug:
+    _debug_severity_state(out, z_cols, component_prefix, severity_name, label_name, note="before return")
 
 # ============================================================================
 # dip-ingestion-platform/mod-ml/aaa-inferencing-lambda/lambda_function.py
