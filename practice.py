@@ -1,90 +1,42 @@
-import inspect
-from aaa.exp.severity.severity_metric import compute_severity
-
-print("Signature:", inspect.signature(compute_severity))
-print("Source:", inspect.getsource(compute_severity)[:400], "...\n")
-
-================end=================
-
-import os, re, pathlib
-
-root = pathlib.Path.cwd() / "src"   # adjust if your repo root is different
-hits = []
-for p in root.rglob("*.py"):
+def _debug_severity_state(
+    out: pd.DataFrame,
+    z_cols: dict[str, str],
+    component_prefix: str,
+    severity_name: str,
+    label_name: str,
+    note: str = ""
+) -> None:
     try:
-        txt = p.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        continue
-    for i, line in enumerate(txt.splitlines(), 1):
-        if "return_components" in line:
-            hits.append((str(p.relative_to(root)), i, line.strip()))
+        comp_cols = [f"{component_prefix}{k}_score" for k in z_cols.keys()]
+        present = [c for c in comp_cols if c in out.columns]
+        missing = [c for c in comp_cols if c not in out.columns]
 
-for file, line_no, line in hits:
-    print(f"{file}:{line_no}: {line}")
+        print(f"\n[SEV][dbg]{' ' + note if note else ''} :: rows={len(out):,}")
+        print(f"[SEV][dbg] component cols expected={len(comp_cols)}, present={len(present)}, missing={len(missing)}")
+        if missing:
+            print(f"[SEV][dbg] missing comp cols: {missing}")
 
-================end=================
+        if present:
+            nz = out[present].apply(pd.to_numeric, errors="coerce").abs().sum()
+            any_nz = bool((nz > 0).any())
+            print(f"[SEV][dbg] component non-zero sums (first 8): {nz.to_dict()}")
+            print(f"[SEV][dbg] any component non-zero? {any_nz}")
 
-yhits = []
-for p in root.rglob("*.yaml"):
-    txt = p.read_text(encoding="utf-8", errors="ignore")
-    if "return_components" in txt:
-        yhits.append((str(p.relative_to(root)), txt))
-for file, txt in yhits:
-    print(f"\nYAML mentions return_components -> {file}\n{txt}")
+        if "Severity_S0" in out.columns:
+            s0 = pd.to_numeric(out["Severity_S0"], errors="coerce")
+            print(f"[SEV][dbg] S0 min/max: {s0.min():.6g} / {s0.max():.6g} | any>0? {bool((s0>0).any())}")
 
-================end=================
+        if severity_name in out.columns:
+            sv = pd.to_numeric(out[severity_name], errors="coerce")
+            print(
+                f"[SEV][dbg] {severity_name} min/max: {sv.min():.6g} / {sv.max():.6g} | "
+                f">=0.3: {(sv>=0.3).sum():,}  >=0.7: {(sv>=0.7).sum():,}"
+            )
 
-from importlib import reload
-import aaa.exp.severity.severity_metric as sm
-
-# keep original
-orig_compute_severity = sm.compute_severity
-
-def _logged_compute_severity(*args, **kwargs):
-    rc_val = kwargs.get("return_components", "<not provided>")
-    print(f"[compute_severity] return_components passed = {rc_val}")
-    return orig_compute_severity(*args, **kwargs)
-
-# monkey-patch
-sm.compute_severity = _logged_compute_severity
-reload(sm)  # ensure module is consistent (safe; patch sticks)
-
-# Re-import handler to use the patched function
-import aaa.exp.severity.severity_handler as sh
-reload(sh)
-
-# Re-run your handler call now; the console will show the value used
-
-================end=================
-
-from aaa.exp.severity.severity_handler import run_severity_handler
-
-results = run_severity_handler(
-    df=feat,
-    config_path="severity/severity_config.yaml",
-    plotters=plotters,
-    do_plots=True,
-    return_figs=True,  # your plotting flag
-    # 👇 force components kept, regardless of config/wrappers
-    # (only if your handler forwards **kwargs to compute_severity)
-)
-
-================end=================
-
-from aaa.exp.severity.severity_metric import compute_severity
-df_sev = compute_severity(..., return_components=True)
-
-================end=================
-
-expected = [f"{k}_score" for k in ["SC","SS","SL","ZB","BU","IDLE"]]
-missing = [c for c in expected if c not in df_sev.columns]
-print("Missing component columns:", missing)
-print("Any nonzero components?:", df_sev.filter(expected).abs().sum().sum() > 0)
-
-print(df_sev["Severity_S0"].describe())
-print(df_sev["Severity_final"].describe())
-
-
+        if label_name in out.columns:
+            print(f"[SEV][dbg] label value counts:\n{out[label_name].value_counts(dropna=False).to_string()}")
+    except Exception as e:
+        print(f"[SEV][dbg] (error while debugging): {e}")
 
 # ============================================================================
 # dip-ingestion-platform/mod-ml/aaa-inferencing-lambda/lambda_function.py
