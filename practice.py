@@ -1,3 +1,10 @@
+# Optionally drop component columns to keep output lean
+if not return_components:
+    drop_cols = [c for c in out.columns if c.endswith("_score") and c.startswith(component_prefix)]
+    out = out.drop(columns=drop_cols, errors="ignore")
+
+return out
+
 # -------------------------------------------------------
 # Reconcile anomalies vs severity RIGHT AFTER creating `feat`
 # -------------------------------------------------------
