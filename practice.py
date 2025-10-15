@@ -1,3 +1,9 @@
+python -m src.aaa.exp.run_experiment \
+  --data data_stream/processed/date_2024-*/part.parquet \
+  --features configs/features/fs_v1.yaml \
+  --config configs/experiments/iforest_v1.yaml \
+  --experiment-name AAA-Experiments
+
 def _debug_severity_state(
     out: pd.DataFrame,
     z_cols: dict[str, str],
