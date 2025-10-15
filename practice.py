@@ -1,3 +1,68 @@
+# -------------------------------------------------------
+# Reconcile anomalies vs severity RIGHT AFTER creating `feat`
+# -------------------------------------------------------
+import numpy as np, pandas as pd
+from importlib import reload
+import aaa.exp.severity.severity_metric as sm
+reload(sm)  # make 100% sure we use the latest scorer
+
+# 1) Expected z columns (must match feat.columns exactly)
+z_cols = {
+    "SC":  "SC_z_score_session_cnt",
+    "SS":  "SS_z_score_max",
+    "SL":  "SL_z_score",
+    "ZB":  "ZB_z_score",
+    "BU":  "BU_z_score_bytes_usage",
+    "IDLE":"IDLE_z_idle",
+}
+print("Expected z cols present?")
+for k,v in z_cols.items():
+    print(f"{k:5s} -> {v:28s} | present={v in feat.columns}")
+
+present = [v for v in z_cols.values() if v in feat.columns]
+missing = [v for v in z_cols.values() if v not in feat.columns]
+print("\nMissing:", missing)
+
+# 2) Do those present columns actually have signal?
+if present:
+    Z = feat[present].apply(pd.to_numeric, errors="coerce")
+    print("\nDescribe z-columns:")
+    print(Z.describe(percentiles=[.5,.9,.99]))
+    print("\nNon-zero counts per z-column:")
+    print((Z.abs() > 0).sum())
+    print("\nRows with ANY |z|≥3 in merged feat:")
+    print((Z.abs().ge(3).any(axis=1)).sum())
+else:
+    print("\nNo expected z columns in feat -> severity will be 0.")
+    
+# 3) Compute severity directly on `feat`
+weights = {"SC":0.15, "SS":0.15, "SL":0.20, "ZB":0.20, "BU":0.15, "IDLE":0.15}
+df_sev = sm.compute_severity(
+    df=feat,
+    z_cols=z_cols,
+    weights=weights,
+    default_scale=3.0,            # same scale you intended
+    severity_name="Severity_final",
+    label_name="Severity_label",
+    label_bins=(0.30, 0.70),
+)
+
+print("\n--- Severity_S0 ---")
+print(df_sev["Severity_S0"].describe(percentiles=[.5,.9,.99]))
+print("\n--- Severity_final ---")
+print(df_sev["Severity_final"].describe(percentiles=[.5,.9,.99]))
+
+thr = 0.7
+print("\nRows >= 0.7:", (pd.to_numeric(df_sev["Severity_final"], errors="coerce") >= thr).sum())
+
+# 4) If still flat, show whether component scores are all zero
+comp_cols = [f"{k}_score" for k in z_cols.keys()]
+existing_comp = [c for c in comp_cols if c in df_sev.columns]
+if existing_comp:
+    print("\nComponent-score non-zero counts:")
+    print((df_sev[existing_comp].apply(pd.to_numeric, errors="coerce").abs() > 0).sum())
+else:
+    print("\nNo component score columns found (SC_score, …). That would force zeros.")
 # ============================
 # QUICK ANOMALY SANITY AUDIT
 # ============================
