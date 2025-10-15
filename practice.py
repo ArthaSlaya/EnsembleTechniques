@@ -1,222 +1,91 @@
-# Optionally drop component columns to keep output lean
-if not return_components:
-    drop_cols = [c for c in out.columns if c.endswith("_score") and c.startswith(component_prefix)]
-    out = out.drop(columns=drop_cols, errors="ignore")
+import inspect
+from aaa.exp.severity.severity_metric import compute_severity
 
-return out
+print("Signature:", inspect.signature(compute_severity))
+print("Source:", inspect.getsource(compute_severity)[:400], "...\n")
 
-# -------------------------------------------------------
-# Reconcile anomalies vs severity RIGHT AFTER creating `feat`
-# -------------------------------------------------------
-import numpy as np, pandas as pd
+================end=================
+
+import os, re, pathlib
+
+root = pathlib.Path.cwd() / "src"   # adjust if your repo root is different
+hits = []
+for p in root.rglob("*.py"):
+    try:
+        txt = p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        continue
+    for i, line in enumerate(txt.splitlines(), 1):
+        if "return_components" in line:
+            hits.append((str(p.relative_to(root)), i, line.strip()))
+
+for file, line_no, line in hits:
+    print(f"{file}:{line_no}: {line}")
+
+================end=================
+
+yhits = []
+for p in root.rglob("*.yaml"):
+    txt = p.read_text(encoding="utf-8", errors="ignore")
+    if "return_components" in txt:
+        yhits.append((str(p.relative_to(root)), txt))
+for file, txt in yhits:
+    print(f"\nYAML mentions return_components -> {file}\n{txt}")
+
+================end=================
+
 from importlib import reload
 import aaa.exp.severity.severity_metric as sm
-reload(sm)  # make 100% sure we use the latest scorer
 
-# 1) Expected z columns (must match feat.columns exactly)
-z_cols = {
-    "SC":  "SC_z_score_session_cnt",
-    "SS":  "SS_z_score_max",
-    "SL":  "SL_z_score",
-    "ZB":  "ZB_z_score",
-    "BU":  "BU_z_score_bytes_usage",
-    "IDLE":"IDLE_z_idle",
-}
-print("Expected z cols present?")
-for k,v in z_cols.items():
-    print(f"{k:5s} -> {v:28s} | present={v in feat.columns}")
+# keep original
+orig_compute_severity = sm.compute_severity
 
-present = [v for v in z_cols.values() if v in feat.columns]
-missing = [v for v in z_cols.values() if v not in feat.columns]
-print("\nMissing:", missing)
+def _logged_compute_severity(*args, **kwargs):
+    rc_val = kwargs.get("return_components", "<not provided>")
+    print(f"[compute_severity] return_components passed = {rc_val}")
+    return orig_compute_severity(*args, **kwargs)
 
-# 2) Do those present columns actually have signal?
-if present:
-    Z = feat[present].apply(pd.to_numeric, errors="coerce")
-    print("\nDescribe z-columns:")
-    print(Z.describe(percentiles=[.5,.9,.99]))
-    print("\nNon-zero counts per z-column:")
-    print((Z.abs() > 0).sum())
-    print("\nRows with ANY |z|≥3 in merged feat:")
-    print((Z.abs().ge(3).any(axis=1)).sum())
-else:
-    print("\nNo expected z columns in feat -> severity will be 0.")
-    
-# 3) Compute severity directly on `feat`
-weights = {"SC":0.15, "SS":0.15, "SL":0.20, "ZB":0.20, "BU":0.15, "IDLE":0.15}
-df_sev = sm.compute_severity(
+# monkey-patch
+sm.compute_severity = _logged_compute_severity
+reload(sm)  # ensure module is consistent (safe; patch sticks)
+
+# Re-import handler to use the patched function
+import aaa.exp.severity.severity_handler as sh
+reload(sh)
+
+# Re-run your handler call now; the console will show the value used
+
+================end=================
+
+from aaa.exp.severity.severity_handler import run_severity_handler
+
+results = run_severity_handler(
     df=feat,
-    z_cols=z_cols,
-    weights=weights,
-    default_scale=3.0,            # same scale you intended
-    severity_name="Severity_final",
-    label_name="Severity_label",
-    label_bins=(0.30, 0.70),
+    config_path="severity/severity_config.yaml",
+    plotters=plotters,
+    do_plots=True,
+    return_figs=True,  # your plotting flag
+    # 👇 force components kept, regardless of config/wrappers
+    # (only if your handler forwards **kwargs to compute_severity)
 )
 
-print("\n--- Severity_S0 ---")
-print(df_sev["Severity_S0"].describe(percentiles=[.5,.9,.99]))
-print("\n--- Severity_final ---")
-print(df_sev["Severity_final"].describe(percentiles=[.5,.9,.99]))
+================end=================
 
-thr = 0.7
-print("\nRows >= 0.7:", (pd.to_numeric(df_sev["Severity_final"], errors="coerce") >= thr).sum())
+from aaa.exp.severity.severity_metric import compute_severity
+df_sev = compute_severity(..., return_components=True)
 
-# 4) If still flat, show whether component scores are all zero
-comp_cols = [f"{k}_score" for k in z_cols.keys()]
-existing_comp = [c for c in comp_cols if c in df_sev.columns]
-if existing_comp:
-    print("\nComponent-score non-zero counts:")
-    print((df_sev[existing_comp].apply(pd.to_numeric, errors="coerce").abs() > 0).sum())
-else:
-    print("\nNo component score columns found (SC_score, …). That would force zeros.")
-# ============================
-# QUICK ANOMALY SANITY AUDIT
-# ============================
-import pandas as pd
-import numpy as np
+================end=================
 
-# ---- configure the inputs (use your existing DataFrame names) ----
-sources = {
-    "session_counts": {
-        "df":  session_counts,
-        "id":  ("device_id", "date"),
-        "flags": ["AnomalySessionCount"],                 # 0/1
-        "zcols": ["z_score_session_cnt"],                 # z-score
-    },
-    "short_sessions": {
-        "df":  short_sessions,
-        "id":  ("device_id", "date"),                    # (your screenshot shows 'hour_ts' too, but daily looks ok)
-        "flags": ["ShortSessionAnomaly"],
-        "zcols": ["z_score"],
-    },
-    "session_length": {
-        "df":  session_length,
-        "id":  ("device_id", "date"),
-        "flags": ["SessionLengthAnomaly"],               # name from screenshot
-        "zcols": ["z_score"],
-    },
-    "zero_bytes": {
-        "df":  zero_bytes,
-        "id":  ("device_id", "date"),
-        "flags": ["ZeroByteAnomaly"],
-        "zcols": ["z_score"],
-    },
-    "bytes_usage_df": {
-        "df":  bytes_usage_df,
-        "id":  ("device_id", "date"),
-        "flags": ["ZeroBytesUsageAnomaly"],
-        "zcols": ["z_score_bytes_usage"],
-    },
-    "idle_df": {
-        "df":  idle_df,
-        "id":  ("device_id", "date"),
-        "flags": ["IdleTimeAnomalyFlag"],
-        "zcols": ["z_idle"],
-    },
-}
+expected = [f"{k}_score" for k in ["SC","SS","SL","ZB","BU","IDLE"]]
+missing = [c for c in expected if c not in df_sev.columns]
+print("Missing component columns:", missing)
+print("Any nonzero components?:", df_sev.filter(expected).abs().sum().sum() > 0)
 
-Z_THR = 3.0  # statistical anomaly threshold for |z|
+print(df_sev["Severity_S0"].describe())
+print(df_sev["Severity_final"].describe())
 
-def _to_num(s):
-    return pd.to_numeric(s, errors="coerce").replace([np.inf,-np.inf], np.nan)
 
-def summarize_source(name, cfg):
-    df = cfg["df"].copy()
-    did, ddate = cfg["id"]
-    flags = [c for c in cfg.get("flags", []) if c in df.columns]
-    zcols = [c for c in cfg.get("zcols", []) if c in df.columns]
 
-    # basic shape
-    out = {}
-    out["rows"] = len(df)
-    out["unique_devices"] = df[did].nunique() if did in df.columns else None
-    out["date_min"] = pd.to_datetime(df[ddate]).min() if ddate in df.columns else None
-    out["date_max"] = pd.to_datetime(df[ddate]).max() if ddate in df.columns else None
-
-    # flags
-    flag_rows = 0
-    flag_devices = 0
-    if flags:
-        fsum = df[flags].fillna(0).sum(axis=1)
-        flag_rows = int((fsum > 0).sum())
-        if {did, ddate}.issubset(df.columns):
-            flag_devices = int(df.loc[fsum > 0, [did, ddate]].drop_duplicates([did, ddate])[did].nunique())
-    out["flag_rows"] = flag_rows
-    out["flag_devices"] = flag_devices
-
-    # z-score exceedances
-    zexc_rows = 0
-    zexc_devices = 0
-    if zcols:
-        Z = df[zcols].apply(_to_num).abs()
-        any_exc = Z.ge(Z_THR).any(axis=1)
-        zexc_rows = int(any_exc.sum())
-        if {did, ddate}.issubset(df.columns):
-            zexc_devices = int(df.loc[any_exc, [did, ddate]].drop_duplicates([did, ddate])[did].nunique())
-    out["|z|>=thr_rows"] = zexc_rows
-    out["|z|>=thr_devices"] = zexc_devices
-
-    # per-day unique devices flagged (flags OR |z|>=thr)
-    daily = None
-    if {did, ddate}.issubset(df.columns) and (flags or zcols):
-        any_flag = pd.Series(False, index=df.index)
-        if flags:
-            any_flag |= (df[flags].fillna(0).sum(axis=1) > 0)
-        if zcols:
-            Z = df[zcols].apply(_to_num).abs()
-            any_flag |= Z.ge(Z_THR).any(axis=1)
-        tmp = df.loc[any_flag, [did, ddate]].copy()
-        if not tmp.empty:
-            tmp[ddate] = pd.to_datetime(tmp[ddate])
-            daily = (tmp.drop_duplicates([did, ddate])
-                        .groupby(ddate)[did]
-                        .nunique()
-                        .rename("devices_flagged")
-                        .reset_index())
-    return out, daily
-
-# ---- run audit ----
-print(f"=== Anomaly Sanity Audit (|z| >= {Z_THR}) ===")
-daily_union_list = []
-summary_rows = []
-
-for name, cfg in sources.items():
-    # skip if df is missing
-    if cfg["df"] is None:
-        summary_rows.append({"source": name, "rows": 0, "note": "df is None"})
-        continue
-
-    stats, daily = summarize_source(name, cfg)
-    summary_rows.append({"source": name, **stats})
-    if daily is not None and not daily.empty:
-        daily_union_list.append(daily.assign(source=name))
-
-# Pretty summary table
-summary_df = pd.DataFrame(summary_rows).fillna("")
-display(summary_df)
-
-# Union (per-day across all sources)
-if daily_union_list:
-    daily_all = pd.concat(daily_union_list, ignore_index=True)
-    daily_all["date"] = pd.to_datetime(daily_all["date"])
-    per_day_union = (daily_all.groupby("date")["devices_flagged"]
-                               .sum()
-                               .rename("devices_flagged_sum")
-                               .reset_index())
-    print("\nDaily total devices flagged (sum across sources):")
-    display(per_day_union.head(15))
-else:
-    print("\nNo per-day flagged devices in any source (by flags or |z|>=thr).")
-
-# Quick red/yellow/green verdict
-if (summary_df[["flag_rows","|z|>=thr_rows"]].astype(str) != "").all(axis=None):
-    any_flags = (pd.to_numeric(summary_df["flag_rows"], errors="coerce").fillna(0) > 0).any()
-    any_zexc = (pd.to_numeric(summary_df["|z|>=thr_rows"], errors="coerce").fillna(0) > 0).any()
-    if any_flags or any_zexc:
-        print("\n✅ Anomalies DO exist in at least one source.")
-    else:
-        print("\n⚠️  No anomalies detected in sources. Check thresholds, preprocessing, or joins.")
 # ============================================================================
 # dip-ingestion-platform/mod-ml/aaa-inferencing-lambda/lambda_function.py
 # ============================================================================
