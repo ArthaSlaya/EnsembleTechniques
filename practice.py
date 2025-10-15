@@ -1,3 +1,12 @@
+from src.aaa.exp.run_experiment import read_yaml, build_feature_matrix, load_parquet_glob
+
+df = load_parquet_glob("data_stream/processed/date_2024-*/part.parquet")
+feat_spec = read_yaml("configs/features/fs_v1.yaml")
+
+print("Columns in parquet:", len(df.columns))
+print(sorted(df.columns[:15]))  # first few names
+print("Feature YAML:", feat_spec.get("features", {}))
+
 python -m src.aaa.exp.run_experiment \
   --data data_stream/processed/date_2024-*/part.parquet \
   --features configs/features/fs_v1.yaml \
