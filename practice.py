@@ -1,3 +1,24 @@
+from difflib import get_close_matches
+
+def audit_features(df, input_cols):
+    cols = set(map(str, df.columns))
+    missing = [c for c in input_cols if c not in cols]
+    print(f"\nFound {len(cols)} columns, expecting {len(input_cols)} features.")
+    if not missing:
+        print("✅ No missing feature columns")
+        return
+    print("❌ Missing:", missing)
+    # show closest guesses to catch tiny typos/pluralization/case
+    for c in missing:
+        guess = get_close_matches(c, cols, n=3, cutoff=0.6)
+        if guess:
+            print(f"  → close to {c}: {guess}")
+
+# call it right before raising KeyError
+print("DataFrame cols (first 20):", list(df.columns)[:20])
+print("Input cols (first 20):", input_cols[:20])
+audit_features(df, input_cols)
+
 def resolve_feature_list(feat_spec: Dict[str, Any],
                          select: str | list[str] | None,
                          exclude: list[str] | None) -> list[str]:
