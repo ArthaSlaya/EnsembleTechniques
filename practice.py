@@ -19,31 +19,36 @@ print("DataFrame cols (first 20):", list(df.columns)[:20])
 print("Input cols (first 20):", input_cols[:20])
 audit_features(df, input_cols)
 
-def resolve_feature_list(feat_spec: Dict[str, Any],
-                         select: str | list[str] | None,
-                         exclude: list[str] | None) -> list[str]:
-    feats = feat_spec.get("features", {})
-    groups = feats.get("feature_groups", {}) or {}
-    all_feats = feats.get("feature_all", []) or []
+def resolve_feature_list(feature_yaml, feature_select, feature_exclude=None):
+    # Accept both schemas
+    groups = (feature_yaml.get("feature_groups")
+              or feature_yaml.get("features", {}).get("groups", {}))
+    feature_all = (feature_yaml.get("feature_all")
+                   or feature_yaml.get("features", {}).get("all", []))
 
-    # Default to “all”
-    if select in (None, "all"):
-        chosen = list(all_feats)
-    elif isinstance(select, list):
+    # Normalize selector -> list of group names or "all"
+    if feature_select is None:
+        # default to all defined features
+        chosen = feature_all or [c for g in groups.values() for c in g]
+    elif isinstance(feature_select, str):
+        if feature_select.lower() in {"feature_all", "all", "*"}:
+            chosen = feature_all or [c for g in groups.values() for c in g]
+        else:
+            chosen = groups.get(feature_select, [])
+    else:  # list/tuple of group names
         chosen = []
-        for g in select:
-            if g not in groups:
-                raise KeyError(f"Unknown feature group: {g}")
-            chosen.extend(groups[g])
-        # de-dup but preserve order
-        seen = set()
-        chosen = [c for c in chosen if not (c in seen or seen.add(c))]
-    else:
-        raise ValueError("feature_select must be 'all' or a list of group names")
+        for s in feature_select:
+            if isinstance(s, str) and s.lower() in {"feature_all", "all", "*"}:
+                chosen = feature_all or [c for g in groups.values() for c in g]
+                break
+            chosen += groups.get(s, [])
 
-    # Exclusions by explicit column name
-    excl = set(exclude or [])
-    chosen = [c for c in chosen if c not in excl]
+    # Exclusions + de-dupe (order-preserving)
+    if feature_exclude:
+        ex = set(feature_exclude)
+        chosen = [c for c in chosen if c not in ex]
+    seen = set()
+    chosen = [c for c in chosen if not (c in seen or seen.add(c))]
     return chosen
     
 def build_feature_matrix(df: pd.DataFrame, feature_yaml: Dict[str, Any], *,
