@@ -1,3 +1,61 @@
+def resolve_feature_list(feat_spec: Dict[str, Any],
+                         select: str | list[str] | None,
+                         exclude: list[str] | None) -> list[str]:
+    feats = feat_spec.get("features", {})
+    groups = feats.get("feature_groups", {}) or {}
+    all_feats = feats.get("feature_all", []) or []
+
+    # Default to “all”
+    if select in (None, "all"):
+        chosen = list(all_feats)
+    elif isinstance(select, list):
+        chosen = []
+        for g in select:
+            if g not in groups:
+                raise KeyError(f"Unknown feature group: {g}")
+            chosen.extend(groups[g])
+        # de-dup but preserve order
+        seen = set()
+        chosen = [c for c in chosen if not (c in seen or seen.add(c))]
+    else:
+        raise ValueError("feature_select must be 'all' or a list of group names")
+
+    # Exclusions by explicit column name
+    excl = set(exclude or [])
+    chosen = [c for c in chosen if c not in excl]
+    return chosen
+    
+def build_feature_matrix(df: pd.DataFrame, feature_yaml: Dict[str, Any], *,
+                         feature_select: str | list[str] | None = None,
+                         feature_exclude: list[str] | None = None
+                         ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    feats = feature_yaml.get("features", {})
+    id_cols = feats.get("id", [])
+
+    # pick columns
+    input_cols = resolve_feature_list(feature_yaml, feature_select, feature_exclude)
+
+    # validate presence
+    missing = [c for c in input_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing feature columns in data: {missing}")
+
+    iddf = df[id_cols].copy() if id_cols else pd.DataFrame(index=df.index)
+    Xdf = df[input_cols].copy()
+
+    # cast + fill
+    Xdf = Xdf.apply(pd.to_numeric, errors="coerce").fillna(Xdf.mean()).fillna(0.0)
+
+    # small log to stdout (helpful during sweeps)
+    print(f"[features] using {len(input_cols)} cols; first 5: {input_cols[:5]}")
+    return Xdf, iddf
+    
+feature_select = cfg.get("feature_select", "all")
+feature_exclude = cfg.get("feature_exclude", [])
+Xdf, iddf = build_feature_matrix(df, feat_spec,
+                                 feature_select=feature_select,
+                                 feature_exclude=feature_exclude)
+
 from src.aaa.exp.run_experiment import read_yaml, build_feature_matrix, load_parquet_glob
 
 df = load_parquet_glob("data_stream/processed/date_2024-*/part.parquet")
