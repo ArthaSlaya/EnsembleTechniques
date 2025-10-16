@@ -1,3 +1,21 @@
+# after: feat_spec = read_yaml(args.features)
+
+groups = feat_spec.get("feature_groups") or (feat_spec.get("features", {}) or {}).get("groups", {})
+all_list = feat_spec.get("feature_all")  or (feat_spec.get("features", {}) or {}).get("all", [])
+
+print(f"[features] groups={len(groups)}  all={len(all_list)}", flush=True)
+if groups:
+    key = next(iter(groups))
+    print(f"[features] sample group: {key} -> {groups[key][:5]}", flush=True)
+
+# now resolve the actual columns to use
+cols = resolve_feature_list(feat_spec, args.feature_select, feature_exclude=None)
+print(f"[features] selector={args.feature_select} -> {len(cols)} columns", flush=True)
+print("[features] first 10:", cols[:10], flush=True)
+
+if not cols:
+    raise ValueError("Feature selection resolved to 0 columns. Check --feature-select and YAML keys.")
+
 from difflib import get_close_matches
 
 def audit_features(df, input_cols):
