@@ -1,4 +1,343 @@
 #=====================================================================
+# Run experiment (importable + CLI) — pipeline-compatible, no severity
+#=====================================================================
+from __future__ import annotations
+import argparse, json, time, hashlib, logging
+from pathlib import Path
+from typing import Dict, Any, List, Tuple, Optional, Union
+
+import numpy as np
+import pandas as pd
+import yaml
+import mlflow
+import mlflow.sklearn
+
+from src.aaa.models.model_zoo import build_pipeline, anomaly_scores
+
+# ---------------------------
+# logging
+# ---------------------------
+def _setup_logger():
+    logger = logging.getLogger("aaa.run_experiment")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] [run_experiment] %(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    try:
+        from logging.handlers import RotatingFileHandler
+        import os
+        os.makedirs("logs", exist_ok=True)
+        fh = RotatingFileHandler("logs/pipeline.log", maxBytes=5_000_000, backupCount=3)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass
+    return logger
+
+log = _setup_logger()
+
+# ---------------------------
+# utils
+# ---------------------------
+def _read_yaml(path: str | Path) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return yaml.safe_load(f) or {}
+
+def _sha1(txt: str) -> str:
+    return hashlib.sha1(txt.encode("utf-8")).hexdigest()[:12]
+
+def _load_parquet_glob(glob_path: str | Path) -> pd.DataFrame:
+    import glob
+    files = sorted(glob.glob(str(glob_path)))
+    if not files:
+        raise FileNotFoundError(f"No parquet files matched: {glob_path}")
+    log.info(f"Loading {len(files)} parquet file(s) from {glob_path}")
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+def _resolve_feature_list(feat_spec: Dict[str, Any],
+                          select: Union[str, list, None],
+                          exclude: Optional[list[str]]) -> list[str]:
+    # Support both layouts:
+    # A) {features:{feature_groups:{...}, feature_all:[...]}}
+    # B) {feature_groups:{...}, feature_all:[...]}
+    feats = feat_spec.get("features", feat_spec or {})
+    groups = feats.get("feature_groups", feat_spec.get("feature_groups", {})) or {}
+    all_feats = feats.get("feature_all", feat_spec.get("feature_all", [])) or []
+
+    # If feature_all missing, union of all groups
+    if not all_feats and groups:
+        seen = set(); out = []
+        for cols in groups.values():
+            for c in cols:
+                if c not in seen:
+                    seen.add(c); out.append(c)
+        all_feats = out
+
+    # Normalize select
+    if isinstance(select, str):
+        s = select.strip()
+        if s.startswith("[") and s.endswith("]"):
+            select = [v.strip().strip("'\"") for v in s[1:-1].split(",") if v.strip()]
+        elif s.lower() in {"all", "feature_all", "features_all"}:
+            select = None  # treat as 'all'
+
+    if select is None:
+        chosen = list(all_feats)
+    elif isinstance(select, list):
+        chosen = []
+        seen = set()
+        for g in select:
+            if g not in groups:
+                raise KeyError(f"Unknown feature group: {g}")
+            for c in groups[g]:
+                if c not in seen:
+                    seen.add(c); chosen.append(c)
+    else:
+        raise ValueError("feature_select must be 'all'/'feature_all' or a list of groups")
+
+    excl = set(exclude or [])
+    cols = [c for c in chosen if c not in excl]
+    log.info(f"Selected {len(cols)} feature(s).")
+    return cols
+
+def _build_feature_matrix(df: pd.DataFrame, feature_yaml: Dict[str, Any], *,
+                          feature_select: Union[str, list, None],
+                          feature_exclude: Optional[list[str]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    feats = feature_yaml.get("features", feature_yaml)
+    id_cols = feats.get("id", feature_yaml.get("id", [])) or []
+
+    input_cols = _resolve_feature_list(feature_yaml, feature_select, feature_exclude)
+    missing = [c for c in input_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing feature columns in data (first 10): {missing[:10]}")
+
+    iddf = df[id_cols].copy() if id_cols else pd.DataFrame(index=df.index)
+    Xdf = df[input_cols].copy()
+    # Coerce numeric + fill
+    Xdf = Xdf.apply(pd.to_numeric, errors="coerce").fillna(Xdf.mean()).fillna(0.0)
+    log.info(f"Feature matrix shape: {Xdf.shape} (rows, cols)")
+    return Xdf, iddf
+
+def _summarize_scores(scores: np.ndarray) -> Dict[str, float]:
+    s = np.asarray(scores).reshape(-1)
+    return {
+        "score_min": float(np.min(s)),
+        "score_max": float(np.max(s)),
+        "score_mean": float(np.mean(s)),
+        "score_var": float(np.var(s)),
+    }
+
+# ---------------------------
+# importable function (used by sweep)
+# ---------------------------
+def run_experiment(
+    *,
+    data_glob: str,
+    features_yaml: Union[str, Path, Dict[str, Any]],
+    config: Union[str, Path, Dict[str, Any]],
+    experiment_name: str = "AAA-Experiments",
+    mlflow_uri: Optional[str] = None,
+    feature_select: Union[str, list, None] = "all",
+    feature_exclude: Optional[list[str]] = None,
+    topk_export: int = 200,
+) -> Dict[str, Any]:
+    # MLflow setup
+    if mlflow_uri:
+        mlflow.set_tracking_uri(mlflow_uri)
+    mlflow.set_experiment(experiment_name)
+
+    # Load IO
+    df = _load_parquet_glob(data_glob)
+    feat_spec = features_yaml if isinstance(features_yaml, dict) else _read_yaml(features_yaml)
+    cfg       = config        if isinstance(config, dict)        else _read_yaml(config)
+
+    algo: str = (cfg.get("algo") or "").strip().lower()
+    if not algo:
+        raise ValueError("Config missing 'algo' (e.g., isolation_forest / lof)")
+    params: Dict[str, Any] = cfg.get("params", {}) or {}
+
+    # Repro hash
+    cfg_text = yaml.safe_dump(cfg, sort_keys=True)
+    cfg_hash = _sha1(cfg_text)
+
+    # Build features
+    Xdf, iddf = _build_feature_matrix(
+        df, feat_spec,
+        feature_select=feature_select,
+        feature_exclude=feature_exclude
+    )
+    X = Xdf.to_numpy(dtype=float)
+
+    # Build model pipeline
+    pipe, needs_fit_predict = build_pipeline(algo, params)
+
+    # Start run
+    run_name = f"{algo}:{cfg_hash}"
+    with mlflow.start_run(run_name=run_name):
+        # Params/tags
+        mlflow.set_tag("algo", algo)
+        mlflow.set_tag("config_hash", cfg_hash)
+        mlflow.set_tag("dataset_glob", data_glob)
+        mlflow.set_tag("features_file", str(features_yaml if isinstance(features_yaml, (str, Path)) else "inline_yaml"))
+        mlflow.log_param("feature_select", feature_select if isinstance(feature_select, str) else str(feature_select))
+        mlflow.log_param("feature_exclude", ",".join(feature_exclude or []))
+        mlflow.log_params(params)
+
+        # Fit
+        t0 = time.time()
+        if needs_fit_predict: _ = pipe.fit_predict(X)  # e.g., LOF classic
+        else:                 pipe.fit(X)
+        fit_s = time.time() - t0
+        mlflow.log_metric("fit_time_s", fit_s)
+        log.info(f"Fitted {algo} in {fit_s:.3f}s")
+
+        # Score (contract: higher = more anomalous)
+        scores = anomaly_scores(algo, pipe, X)
+        stats = _summarize_scores(scores)
+        mlflow.log_metrics(stats)
+
+        # ---------- Monitoring: extra metrics & artifacts ----------
+        s = np.asarray(scores).reshape(-1)
+
+        # Percentiles
+        pcts = {p: float(np.percentile(s, p)) for p in (50, 90, 95, 99)}
+        mlflow.log_metrics({
+            "score_p50": pcts[50],
+            "score_p90": pcts[90],
+            "score_p95": pcts[95],
+            "score_p99": pcts[99],
+        })
+
+        # Operating points: % anomalies above P95 / P99
+        pct_anom_p95 = float((s >= pcts[95]).mean())
+        pct_anom_p99 = float((s >= pcts[99]).mean())
+        mlflow.log_metrics({
+            "pct_anomalies@p95": pct_anom_p95,
+            "pct_anomalies@p99": pct_anom_p99,
+        })
+
+        # Data profile (for drift checks)
+        profile = {
+            "n_rows": int(Xdf.shape[0]),
+            "n_features": int(Xdf.shape[1]),
+            "feature_means": Xdf.mean().astype(float).round(6).to_dict(),
+            "feature_stds":  Xdf.std(ddof=0).astype(float).round(6).to_dict(),
+        }
+        mlflow.log_dict(profile, "artifacts/data_profile.json")
+
+        # Score histogram
+        try:
+            import matplotlib.pyplot as plt
+            fig = plt.figure()
+            plt.hist(s, bins=50)
+            try:
+                mlflow.log_figure(fig, "plots/score_histogram.png")
+            except Exception:
+                Path("artifacts/plots").mkdir(parents=True, exist_ok=True)
+                tmp = "artifacts/plots/score_histogram.png"
+                fig.savefig(tmp, bbox_inches="tight")
+                mlflow.log_artifact(tmp, artifact_path="plots")
+            finally:
+                plt.close(fig)
+        except Exception as _e:
+            mlflow.set_tag("histogram_error", str(_e))
+
+        # Artifacts: config + features used + top-K table
+        art_dir = Path("artifacts/experiment"); art_dir.mkdir(parents=True, exist_ok=True)
+        cfg_out = art_dir / f"config_{cfg_hash}.yaml"; cfg_out.write_text(cfg_text)
+        mlflow.log_artifact(str(cfg_out), artifact_path="configs")
+
+        used_feats = art_dir / f"features_used_{cfg_hash}.txt"
+        used_feats.write_text("\n".join(list(Xdf.columns)))
+        mlflow.log_artifact(str(used_feats), artifact_path="features")
+
+        # Top-K anomalies table (ids + score, sorted desc)
+        k = max(1, min(int(topk_export), s.size))
+        top_idx = np.argsort(-s)[:k]
+        out = (iddf.iloc[top_idx].copy() if not iddf.empty else pd.DataFrame(index=top_idx))
+        out["anomaly_score"] = s[top_idx]
+        topk_path = art_dir / f"topk_{algo}_{cfg_hash}.csv"
+        out.to_csv(topk_path, index=False)
+        mlflow.log_artifact(str(topk_path), artifact_path="reports")
+
+        # Log model with signature + input example (when possible)
+        try:
+            from mlflow.models.signature import infer_signature
+            import mlflow.sklearn as mls
+            ex = Xdf.head(10)
+            try:
+                _pred = pipe["model"].predict(ex.to_numpy())
+            except Exception:
+                _pred = None
+            sig = infer_signature(ex, _pred)
+            mls.log_model(sk_model=pipe, artifact_path="model",
+                          signature=sig, input_example=ex)
+        except Exception as e:
+            mlflow.set_tag("model_log_error", str(e))
+
+        # Attach rolling log file so you can view logs in MLflow UI
+        try:
+            mlflow.log_artifact("logs/pipeline.log", artifact_path="logs")
+        except Exception:
+            pass
+
+        # Final summary (returned to sweep; single JSON line when used via CLI)
+        summary = {
+            "algo": algo,
+            "config_hash": cfg_hash,
+            "n_samples": int(X.shape[0]),
+            "n_features": int(X.shape[1]),
+            "fit_time_s": round(fit_s, 3),
+            "metrics": {
+                **stats,
+                "score_p50": pcts[50],
+                "score_p90": pcts[90],
+                "score_p95": pcts[95],
+                "score_p99": pcts[99],
+                "pct_anomalies@p95": pct_anom_p95,
+                "pct_anomalies@p99": pct_anom_p99,
+            },
+            "topk_artifact": str(topk_path),
+        }
+        log.info(f"Run summary: {summary['metrics']}")
+        return summary
+
+# ---------------------------
+# CLI wrapper (kept for tooling and back-compat)
+# ---------------------------
+def _cli(argv: List[str] | None = None) -> int:
+    ap = argparse.ArgumentParser("AAA experiment runner")
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--features", required=True)
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--experiment-name", default="AAA-Experiments")
+    ap.add_argument("--mlflow-uri", default="file:./mlruns")
+    ap.add_argument("--feature-select", default="all",
+                    help="all/feature_all or JSON list of groups, e.g. ['SC','SL']")
+    ap.add_argument("--feature-exclude", default="")
+    ap.add_argument("--topk", type=int, default=200)
+    args = ap.parse_args(argv)
+
+    excl = [s.strip() for s in args.feature_exclude.split(",") if s.strip()]
+    summary = run_experiment(
+        data_glob=args.data,
+        features_yaml=args.features,
+        config=args.config,
+        experiment_name=args.experiment_name,
+        mlflow_uri=args.mlflow_uri,
+        feature_select=args.feature_select,
+        feature_exclude=excl,
+        topk_export=args.topk,
+    )
+    print(json.dumps(summary, separators=(",", ":")))  # single line
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())
+#=====================================================================
 # Model zoo (library)
 #=====================================================================
 from __future__ import annotations
