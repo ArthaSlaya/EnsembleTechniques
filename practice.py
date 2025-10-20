@@ -1,3 +1,70 @@
+(aaa-pipeline-practice) bellsi1@DQ47NX2KJ5 AAA_Pipeline_Practice % python -m src.aaa.exp.run_inference \
+  --data "data_stream/processed/date_*/part.parquet" \
+  --features "configs/features/fs_v1.yaml" \
+  --model-uri "mlruns/298184001616162785/models/m-42af30ad91ba4bf59cd861167ae36fa8/artifacts" \
+  --algo isolation_forest \
+  --feature-select all \
+  --out-dir artifacts/inference_best \
+  --return-figs \
+  --log-mlflow
+ Z-cols passed in -> {'SC': 'SC_z_score_session_cnt', 'SS': 'SS_z_score_max', 'SL': 'SL_z_score', 'ZB': 'ZB_z_score', 'BU': 'BU_z_score_bytes_usage', 'IDLE': 'IDLE_z_idle'}
+Keys:  ['SC', 'SS', 'SL', 'ZB', 'BU', 'IDLE']
+Columns present in feat ['SC_z_score_session_cnt', 'SS_z_score_max', 'SL_z_score', 'ZB_z_score', 'BU_z_score_bytes_usage']
+
+[SEV][dbg] after components :: rows=12,749,019
+[SEV][dbg] component cols expected=6, present=6, missing=0
+[SEV][dbg] component non-zero sums (first 8): {'SC_score': 3535889.012643882, 'SS_score': 2015350.9128762751, 'SL_score': 3720331.9813980125, 'ZB_score': 720232.6337252458, 'BU_score': 2691718.4072330752, 'IDLE_score': 0.0}
+[SEV][dbg] any component non-zero? True
+
+[SEV][dbg] before return :: rows=12,749,019
+[SEV][dbg] component cols expected=6, present=6, missing=0
+[SEV][dbg] component non-zero sums (first 8): {'SC_score': 3535889.012643882, 'SS_score': 2015350.9128762751, 'SL_score': 3720331.9813980125, 'ZB_score': 720232.6337252458, 'BU_score': 2691718.4072330752, 'IDLE_score': 0.0}
+[SEV][dbg] any component non-zero? True
+[SEV][dbg] S0 min/max: 0.0159523 / 0.849996 | any>0? True
+[SEV][dbg] Severity_final min/max: 0.0135594 / 0.722496 | >=0.3: 384,513  >=0.7: 891
+[SEV][dbg] label value counts:
+Severity_label
+Low       12364506
+Medium      383622
+High           891
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/bellsi1/Projects/AAA_Pipeline_Practice/src/aaa/exp/run_inference.py", line 306, in <module>
+    raise SystemExit(_cli())
+                     ^^^^^^
+  File "/Users/bellsi1/Projects/AAA_Pipeline_Practice/src/aaa/exp/run_inference.py", line 283, in _cli
+    res = run_inference_and_severity(
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bellsi1/Projects/AAA_Pipeline_Practice/src/aaa/exp/run_inference.py", line 239, in run_inference_and_severity
+    with mlflow.start_run(run_name="inference+severity", nested=bool(active)):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/tracking/fluent.py", line 474, in start_run
+    active_run_obj = client.create_run(
+                     ^^^^^^^^^^^^^^^^^^
+  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/tracking/client.py", line 442, in create_run
+    return self._tracking_client.create_run(experiment_id, start_time, tags, run_name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/telemetry/track.py", line 23, in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/tracking/_tracking_service/client.py", line 173, in create_run
+    return self.store.create_run(
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/store/tracking/rest_store.py", line 271, in create_run
+    response_proto = self._call_endpoint(CreateRun, req_body)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/store/tracking/rest_store.py", line 134, in _call_endpoint
+    return call_endpoint(
+           ^^^^^^^^^^^^^^
+  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/utils/rest_utils.py", line 554, in call_endpoint
+    response = verify_rest_response(response, endpoint)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/utils/rest_utils.py", line 308, in verify_rest_response
+    raise RestException(json.loads(response.text))
+mlflow.exceptions.RestException: RESOURCE_DOES_NOT_EXIST: Could not find experiment with ID 0
+(aaa-pipeline-practice) bellsi1@DQ47NX2KJ5 AAA_Pipeline_Practice % 
+
 --model-uri "mlruns/298184001616162785/models/m-42af30ad91b14bf59cd861167ae36fa8/artifacts/model"
 
 export MLFLOW_TRACKING_URI=http://localhost:5000
