@@ -1,3 +1,5 @@
+--model-uri "mlruns/298184001616162785/models/m-42af30ad91b14bf59cd861167ae36fa8/artifacts/model"
+
 export MLFLOW_TRACKING_URI=http://localhost:5000
 
 python -m src.aaa.exp.inference \
