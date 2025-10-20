@@ -22,7 +22,7 @@ python -m src.aaa.exp.sweeps.run_iforest_sweep
 export MLFLOW_TRACKING_URI=http://localhost:5000
 
 #=====================================================================
-# Run experiment (importable + CLI) — pipeline-compatible, no severity
+# Run experiment (importable + CLI) — inline scoring, no anomaly_scores
 #=====================================================================
 from __future__ import annotations
 import argparse, json, time, hashlib, logging
@@ -35,7 +35,7 @@ import yaml
 import mlflow
 import mlflow.sklearn
 
-from src.aaa.models.model_zoo import build_pipeline, anomaly_scores
+from src.aaa.models.model_zoo import build_pipeline  # NOTE: no anomaly_scores import
 
 # ---------------------------
 # logging
@@ -89,91 +89,91 @@ def _resolve_feature_list(
     Resolve which feature columns to use from the feature spec YAML.
 
     Supports both layouts:
-      A) {features: {feature_groups: {...}, feature_all: [...]}}
-      B) {feature_groups: {...}, feature_all: [...]}
+      A) {features: {feature_groups: {...}, feature_all: [...], id_columns: [...]}}
+      B) {feature_groups: {...}, feature_all: [...], id_columns: [...]}
 
-    Args:
-        feat_spec: Parsed YAML dictionary.
-        select: Feature group(s) to include ('all', list, or single group).
-        exclude: Optional list of feature names to exclude.
-
-    Returns:
-        List of selected feature column names.
+    Accepts CLI styles:
+      - all / feature_all
+      - single group string: SC
+      - JSON-ish list: '["SC","SS"]'
+      - comma-separated: SC,SS
     """
-
-    # --- Support both YAML layouts ---
     feats = feat_spec.get("features", feat_spec or {})
     groups = feats.get("feature_groups", feat_spec.get("feature_groups", {})) or {}
     all_feats = feats.get("feature_all", feat_spec.get("feature_all", [])) or []
 
-    # --- If feature_all missing, union of all groups ---
+    # If feature_all is missing, union of all groups (order-preserving)
     if not all_feats and groups:
-        seen = set()
-        out = []
+        seen, out = set(), []
         for cols in groups.values():
             for c in cols:
                 if c not in seen:
-                    seen.add(c)
-                    out.append(c)
+                    seen.add(c); out.append(c)
         all_feats = out
 
-    # --- Normalize the select input ---
-    if isinstance(select, str):
+    # Normalize select into list[str] | None
+    if select is None:
+        sel_groups = None
+    elif isinstance(select, list):
+        sel_groups = select
+    elif isinstance(select, str):
         s = select.strip()
-        # e.g., '[ "SC","SS"]'
-        if s.startswith("[") and s.endswith("]"):
+        low = s.lower()
+        if low in {"all", "feature_all", "features_all"}:
+            sel_groups = None
+        elif s.startswith("[") and s.endswith("]"):
+            # JSON-ish list
             try:
                 import ast
-                select = ast.literal_eval(s)
+                sel_groups = list(ast.literal_eval(s))
             except Exception:
-                select = [v.strip().strip('"') for v in s[1:-1].split(",") if v.strip()]
-        elif s.lower() in {"all", "feature_all", "features_all"}:
-            select = None  # treat as all
+                sel_groups = [v.strip().strip("'\"") for v in s[1:-1].split(",") if v.strip()]
+        elif "," in s:
+            sel_groups = [v.strip() for v in s.split(",") if v.strip()]
         else:
-            select = s  # single group string
-
-    # --- Determine chosen features ---
-    if select is None:
-        chosen = list(all_feats)
-    elif isinstance(select, list):
-        chosen = []
-        seen = set()
-        for g in select:
-            if g not in groups:
-                raise KeyError(f"Unknown feature group: {g}")
-            for c in groups[g]:
-                if c not in seen:
-                    seen.add(c)
-                    chosen.append(c)
-    elif isinstance(select, str):
-        if select not in groups:
-            raise KeyError(f"Unknown feature group: {select}")
-        chosen = list(groups[select])
+            sel_groups = [s]
     else:
-        raise ValueError("feature_select must be 'all', a list, or a valid group name string")
+        raise ValueError("feature_select must be None, a string, or a list")
 
-    # --- Apply exclusions if any ---
+    # Resolve columns
+    if sel_groups is None:
+        chosen = list(all_feats)
+    else:
+        chosen, seen = [], set()
+        for g in sel_groups:
+            if g in groups:
+                cols = groups[g]
+            else:
+                # allow passing a column name by accident; include directly
+                cols = [g]
+            for c in cols:
+                if c not in seen:
+                    seen.add(c); chosen.append(c)
+
     excl = set(exclude or [])
-    cols = [c for c in chosen if c not in excl]
+    final = [c for c in chosen if c not in excl]
 
-    # --- Logging ---
-    import logging
-    log = logging.getLogger("aaa.run_experiment")
-    log.info(f"Selected {len(cols)} feature(s).")
-
-    return cols
+    log.info(f"feature_select={select} -> groups={sel_groups or 'ALL'} -> {len(final)} columns")
+    if not final:
+        raise RuntimeError(
+            "Feature selection produced 0 columns. "
+            f"Available groups: {sorted(groups.keys())}. "
+            f"feature_all length: {len(all_feats)}."
+        )
+    return final
 
 def _build_feature_matrix(df: pd.DataFrame, feature_yaml: Dict[str, Any], *,
                           feature_select: Union[str, list, None],
                           feature_exclude: Optional[list[str]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # prefer id_columns; fall back to legacy 'id'
     feats = feature_yaml.get("features", feature_yaml)
-    id_cols = feats.get("id", feature_yaml.get("id", [])) or []
+    id_cols = (feats.get("id_columns") or feature_yaml.get("id_columns")
+               or feats.get("id") or feature_yaml.get("id") or [])
 
     input_cols = _resolve_feature_list(feature_yaml, feature_select, feature_exclude)
     missing = [c for c in input_cols if c not in df.columns]
     if missing:
         raise KeyError(f"Missing feature columns in data (first 10): {missing[:10]}")
-
     iddf = df[id_cols].copy() if id_cols else pd.DataFrame(index=df.index)
     Xdf = df[input_cols].copy()
     # Coerce numeric + fill
@@ -234,7 +234,7 @@ def run_experiment(
     # Build model pipeline
     pipe, needs_fit_predict = build_pipeline(algo, params)
 
-    # Start run
+    # Start MLflow run
     run_name = f"{algo}:{cfg_hash}"
     with mlflow.start_run(run_name=run_name):
         # Params/tags
@@ -248,14 +248,38 @@ def run_experiment(
 
         # Fit
         t0 = time.time()
-        if needs_fit_predict: _ = pipe.fit_predict(X)  # e.g., LOF classic
-        else:                 pipe.fit(X)
+        if needs_fit_predict:
+            _ = pipe.fit_predict(X)  # e.g., LOF classic
+        else:
+            pipe.fit(X)
         fit_s = time.time() - t0
         mlflow.log_metric("fit_time_s", fit_s)
         log.info(f"Fitted {algo} in {fit_s:.3f}s")
 
-        # Score (contract: higher = more anomalous)
-        scores = anomaly_scores(algo, pipe, X)
+        # ---------- Inline scoring (no model_zoo.anomaly_scores) ----------
+        a = algo
+        if a == "isolation_forest":
+            raw = pipe["model"].score_samples(X)          # higher = more normal
+            scores = -np.asarray(raw, dtype=float).reshape(-1)
+        elif a == "lof":
+            model = pipe["model"]
+            if getattr(model, "novelty", False):
+                raw = model.decision_function(X)          # higher = more normal
+                scores = -np.asarray(raw, dtype=float).reshape(-1)
+            else:
+                if not hasattr(model, "negative_outlier_factor_"):
+                    raise RuntimeError("LOF classic mode requires fit_predict(X) before scoring.")
+                scores = -np.asarray(model.negative_outlier_factor_, dtype=float).reshape(-1)
+        else:
+            # Generic fallback for future models
+            if hasattr(pipe, "decision_function"):
+                scores = -np.asarray(pipe.decision_function(X), dtype=float).reshape(-1)
+            elif hasattr(pipe, "score_samples"):
+                scores = -np.asarray(pipe.score_samples(X), dtype=float).reshape(-1)
+            else:
+                raise ValueError(f"Unsupported algo for inline scoring: {algo}")
+
+        # Summaries
         stats = _summarize_scores(scores)
         mlflow.log_metrics(stats)
 
@@ -271,7 +295,7 @@ def run_experiment(
             "score_p99": pcts[99],
         })
 
-        # Operating points: % anomalies above P95 / P99
+        # Operating points: % anomalies above P95 / P99 thresholds
         pct_anom_p95 = float((s >= pcts[95]).mean())
         pct_anom_p99 = float((s >= pcts[99]).mean())
         mlflow.log_metrics({
@@ -376,7 +400,7 @@ def _cli(argv: List[str] | None = None) -> int:
     ap.add_argument("--experiment-name", default="AAA-Experiments")
     ap.add_argument("--mlflow-uri", default="file:./mlruns")
     ap.add_argument("--feature-select", default="all",
-                    help="all/feature_all or JSON list of groups, e.g. ['SC','SL']")
+                    help="all/feature_all, SC, or JSON list e.g. ['SC','SS'] or SC,SS")
     ap.add_argument("--feature-exclude", default="")
     ap.add_argument("--topk", type=int, default=200)
     args = ap.parse_args(argv)
