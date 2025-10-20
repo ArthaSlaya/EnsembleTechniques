@@ -5,8 +5,7 @@
   --algo isolation_forest \
   --feature-select all \
   --out-dir artifacts/inference_best \
-  --return-figs \
-  --log-mlflow
+  --return-figs  
  Z-cols passed in -> {'SC': 'SC_z_score_session_cnt', 'SS': 'SS_z_score_max', 'SL': 'SL_z_score', 'ZB': 'ZB_z_score', 'BU': 'BU_z_score_bytes_usage', 'IDLE': 'IDLE_z_idle'}
 Keys:  ['SC', 'SS', 'SL', 'ZB', 'BU', 'IDLE']
 Columns present in feat ['SC_z_score_session_cnt', 'SS_z_score_max', 'SL_z_score', 'ZB_z_score', 'BU_z_score_bytes_usage']
@@ -27,43 +26,12 @@ Severity_label
 Low       12364506
 Medium      383622
 High           891
-Traceback (most recent call last):
-  File "<frozen runpy>", line 198, in _run_module_as_main
-  File "<frozen runpy>", line 88, in _run_code
-  File "/Users/bellsi1/Projects/AAA_Pipeline_Practice/src/aaa/exp/run_inference.py", line 306, in <module>
-    raise SystemExit(_cli())
-                     ^^^^^^
-  File "/Users/bellsi1/Projects/AAA_Pipeline_Practice/src/aaa/exp/run_inference.py", line 283, in _cli
-    res = run_inference_and_severity(
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/bellsi1/Projects/AAA_Pipeline_Practice/src/aaa/exp/run_inference.py", line 239, in run_inference_and_severity
-    with mlflow.start_run(run_name="inference+severity", nested=bool(active)):
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/tracking/fluent.py", line 474, in start_run
-    active_run_obj = client.create_run(
-                     ^^^^^^^^^^^^^^^^^^
-  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/tracking/client.py", line 442, in create_run
-    return self._tracking_client.create_run(experiment_id, start_time, tags, run_name)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/telemetry/track.py", line 23, in wrapper
-    return func(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/tracking/_tracking_service/client.py", line 173, in create_run
-    return self.store.create_run(
-           ^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/store/tracking/rest_store.py", line 271, in create_run
-    response_proto = self._call_endpoint(CreateRun, req_body)
-                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/store/tracking/rest_store.py", line 134, in _call_endpoint
-    return call_endpoint(
-           ^^^^^^^^^^^^^^
-  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/utils/rest_utils.py", line 554, in call_endpoint
-    response = verify_rest_response(response, endpoint)
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/bellsi1/anaconda_business_edition/envs/aaa-pipeline-practice/lib/python3.11/site-packages/mlflow/utils/rest_utils.py", line 308, in verify_rest_response
-    raise RestException(json.loads(response.text))
-mlflow.exceptions.RestException: RESOURCE_DOES_NOT_EXIST: Could not find experiment with ID 0
-(aaa-pipeline-practice) bellsi1@DQ47NX2KJ5 AAA_Pipeline_Practice % 
+{
+  "scored_csv": "artifacts/inference_best/scored_with_severity.csv",
+  "topk_csv": "artifacts/inference_best/topk_isolation_forest.csv",
+  "n_rows": 12749019
+}
+
 
 --model-uri "mlruns/298184001616162785/models/m-42af30ad91b14bf59cd861167ae36fa8/artifacts/model"
 
