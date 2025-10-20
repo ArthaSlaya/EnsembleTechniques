@@ -1,3 +1,26 @@
+python -m src.aaa.exp.run_experiment \
+  --data "data_stream/processed/date_*/part.parquet" \
+  --features "configs/features/fs_v1.yaml" \
+  --config "configs/experiments/iforest_v1.yaml" \
+  --feature-select all \
+  --experiment-name "AAA-Experiments"
+
+python -m src.aaa.exp.run_experiment \
+  --data "data_stream/processed/date_*/part.parquet" \
+  --features "configs/features/fs_v1.yaml" \
+  --config "configs/experiments/iforest_v1.yaml" \
+  --feature-select SC
+
+python -m src.aaa.exp.run_experiment \
+  --data "data_stream/processed/date_*/part.parquet" \
+  --features "configs/features/fs_v1.yaml" \
+  --config "configs/experiments/iforest_v1.yaml" \
+  --feature-select '["SC","SS"]'
+
+python -m src.aaa.exp.sweeps.run_iforest_sweep
+
+export MLFLOW_TRACKING_URI=http://localhost:5000
+
 #=====================================================================
 # Run experiment (importable + CLI) — pipeline-compatible, no severity
 #=====================================================================
