@@ -57,33 +57,59 @@ def _load_parquet_glob(glob_path: str | Path) -> pd.DataFrame:
     log.info(f"Loading {len(files)} parquet file(s) from {glob_path}")
     return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
 
-def _resolve_feature_list(feat_spec: Dict[str, Any],
-                          select: Union[str, list, None],
-                          exclude: Optional[list[str]]) -> list[str]:
-    # Support both layouts:
-    # A) {features:{feature_groups:{...}, feature_all:[...]}}
-    # B) {feature_groups:{...}, feature_all:[...]}
+def _resolve_feature_list(
+    feat_spec: Dict[str, Any],
+    select: Union[str, list[str], None],
+    exclude: Optional[list[str]] = None
+) -> list[str]:
+    """
+    Resolve which feature columns to use from the feature spec YAML.
+
+    Supports both layouts:
+      A) {features: {feature_groups: {...}, feature_all: [...]}}
+      B) {feature_groups: {...}, feature_all: [...]}
+
+    Args:
+        feat_spec: Parsed YAML dictionary.
+        select: Feature group(s) to include ('all', list, or single group).
+        exclude: Optional list of feature names to exclude.
+
+    Returns:
+        List of selected feature column names.
+    """
+
+    # --- Support both YAML layouts ---
     feats = feat_spec.get("features", feat_spec or {})
     groups = feats.get("feature_groups", feat_spec.get("feature_groups", {})) or {}
     all_feats = feats.get("feature_all", feat_spec.get("feature_all", [])) or []
 
-    # If feature_all missing, union of all groups
+    # --- If feature_all missing, union of all groups ---
     if not all_feats and groups:
-        seen = set(); out = []
+        seen = set()
+        out = []
         for cols in groups.values():
             for c in cols:
                 if c not in seen:
-                    seen.add(c); out.append(c)
+                    seen.add(c)
+                    out.append(c)
         all_feats = out
 
-    # Normalize select
+    # --- Normalize the select input ---
     if isinstance(select, str):
         s = select.strip()
+        # e.g., '[ "SC","SS"]'
         if s.startswith("[") and s.endswith("]"):
-            select = [v.strip().strip("'\"") for v in s[1:-1].split(",") if v.strip()]
+            try:
+                import ast
+                select = ast.literal_eval(s)
+            except Exception:
+                select = [v.strip().strip('"') for v in s[1:-1].split(",") if v.strip()]
         elif s.lower() in {"all", "feature_all", "features_all"}:
-            select = None  # treat as 'all'
+            select = None  # treat as all
+        else:
+            select = s  # single group string
 
+    # --- Determine chosen features ---
     if select is None:
         chosen = list(all_feats)
     elif isinstance(select, list):
@@ -94,13 +120,24 @@ def _resolve_feature_list(feat_spec: Dict[str, Any],
                 raise KeyError(f"Unknown feature group: {g}")
             for c in groups[g]:
                 if c not in seen:
-                    seen.add(c); chosen.append(c)
+                    seen.add(c)
+                    chosen.append(c)
+    elif isinstance(select, str):
+        if select not in groups:
+            raise KeyError(f"Unknown feature group: {select}")
+        chosen = list(groups[select])
     else:
-        raise ValueError("feature_select must be 'all'/'feature_all' or a list of groups")
+        raise ValueError("feature_select must be 'all', a list, or a valid group name string")
 
+    # --- Apply exclusions if any ---
     excl = set(exclude or [])
     cols = [c for c in chosen if c not in excl]
+
+    # --- Logging ---
+    import logging
+    log = logging.getLogger("aaa.run_experiment")
     log.info(f"Selected {len(cols)} feature(s).")
+
     return cols
 
 def _build_feature_matrix(df: pd.DataFrame, feature_yaml: Dict[str, Any], *,
