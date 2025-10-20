@@ -1,4 +1,568 @@
 #=====================================================================
+# Model zoo (library)
+#=====================================================================
+from __future__ import annotations
+from typing import Dict, Tuple
+import numpy as np
+import logging
+
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+
+# ---------------------------
+# logging
+# ---------------------------
+def _setup_logger():
+    logger = logging.getLogger("aaa.model_zoo")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] [model_zoo] %(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    try:
+        import os
+        from logging.handlers import RotatingFileHandler
+        os.makedirs("logs", exist_ok=True)
+        fh = RotatingFileHandler("logs/pipeline.log", maxBytes=5_000_000, backupCount=3)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass
+    return logger
+
+log = _setup_logger()
+
+# ---------------------------------------------------------------------
+# PARAM VALIDATION (catch typos early)
+# ---------------------------------------------------------------------
+ALGO_PARAM_WHITELIST = {
+    "isolation_forest": {
+        "n_estimators","max_samples","max_features","contamination",
+        "bootstrap","n_jobs","random_state","warm_start"
+    },
+    "lof": {
+        "n_neighbors","algorithm","leaf_size","metric","p","metric_params",
+        "novelty","n_jobs"
+    },
+    "autoencoder": {  # placeholder
+        "epochs","batch_size","lr","weight_decay","hidden_dims","bottleneck",
+        "dropout","device","seed","early_stop_patience"
+    },
+}
+
+def _validate_params(algo: str, params: Dict) -> None:
+    a = algo.lower()
+    if a not in ALGO_PARAM_WHITELIST:
+        raise ValueError(f"Unsupported algorithm: {algo}")
+    unknown = set(params) - ALGO_PARAM_WHITELIST[a]
+    if unknown:
+        raise ValueError(f"Unknown {algo} params: {sorted(unknown)}")
+
+def _as_1d_float(x) -> np.ndarray:
+    arr = np.asarray(x).reshape(-1).astype(float)
+    if not np.all(np.isfinite(arr)):
+        arr = np.nan_to_num(arr, copy=False)
+    return arr
+
+# ---------------------------------------------------------------------
+# FACTORY: BUILD + (optionally) special fit handling
+# ---------------------------------------------------------------------
+def build_pipeline(algo: str, params: Dict) -> Tuple[Pipeline, bool]:
+    """
+    Returns (pipeline, needs_fit_predict)
+    - needs_fit_predict=True → must call fit_predict(X) (LOF classic).
+    """
+    a = algo.lower()
+    _validate_params(a, params)
+
+    if a == "isolation_forest":
+        model = IsolationForest(**params)
+        pipe = Pipeline([("model", model)])
+        log.info(f"Built IsolationForest with params: {params}")
+        return pipe, False
+
+    if a == "lof":
+        model = LocalOutlierFactor(**params)
+        pipe = Pipeline([("scaler", StandardScaler()), ("model", model)])
+        needs_fp = not bool(params.get("novelty", True))
+        mode = "classic (fit_predict)" if needs_fp else "novelty (fit)"
+        log.info(f"Built LOF ({mode}) with params: {params}")
+        return pipe, needs_fp
+
+    if a == "autoencoder":
+        try:
+            from .autoencoder_model import AutoEncoderWrapper
+        except Exception as e:
+            raise ImportError("Autoencoder module not found: autoencoder_model.AutoEncoderWrapper") from e
+        model = AutoEncoderWrapper(**params)
+        pipe = Pipeline([("scaler", StandardScaler()), ("model", model)])
+        log.info(f"Built Autoencoder wrapper with params: {params}")
+        return pipe, False
+
+    raise ValueError(f"Unknown algo: {algo}")
+
+# ---------------------------------------------------------------------
+# SCORING ADAPTER (higher = more anomalous)
+# ---------------------------------------------------------------------
+def anomaly_scores(algo: str, pipe: Pipeline, X: np.ndarray) -> np.ndarray:
+    a = algo.lower()
+
+    if a == "isolation_forest":
+        raw = pipe["model"].score_samples(X)  # higher = more normal
+        return _as_1d_float(-raw)
+
+    if a == "lof":
+        model: LocalOutlierFactor = pipe["model"]
+        if getattr(model, "novelty", False):
+            raw = model.decision_function(X)   # higher = more normal
+            return _as_1d_float(-raw)
+        else:
+            if not hasattr(model, "negative_outlier_factor_"):
+                raise RuntimeError("LOF classic mode requires fit_predict(X) before scoring.")
+            raw = model.negative_outlier_factor_  # more negative = more anomalous
+            return _as_1d_float(-raw)
+
+    if a == "autoencoder":
+        model = pipe["model"]
+        if not hasattr(model, "reconstruct"):
+            raise AttributeError("AutoEncoderWrapper must implement reconstruct(X).")
+        recon = model.reconstruct(X)
+        err = np.mean((X - recon) ** 2, axis=1)
+        return _as_1d_float(err)
+
+    raise ValueError(f"Unknown algo: {algo}")
+    
+#=====================================================================
+# Run experiment (importable + CLI) — uses model_zoo; logs everywhere
+#=====================================================================
+from __future__ import annotations
+
+import argparse, json, time, hashlib, logging
+from pathlib import Path
+from typing import Dict, Any, List, Tuple, Optional, Union
+
+import numpy as np
+import pandas as pd
+import yaml
+import mlflow
+import mlflow.sklearn
+
+from src.aaa.models.model_zoo import build_pipeline, anomaly_scores
+
+# ---------------------------
+# logging
+# ---------------------------
+def _setup_logger():
+    logger = logging.getLogger("aaa.run_experiment")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] [run_experiment] %(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    try:
+        from logging.handlers import RotatingFileHandler
+        import os
+        os.makedirs("logs", exist_ok=True)
+        fh = RotatingFileHandler("logs/pipeline.log", maxBytes=5_000_000, backupCount=3)
+        fh.setFormatter(fmt)
+        logger.addHandler(fh)
+    except Exception:
+        pass
+    return logger
+
+log = _setup_logger()
+
+# ---------------------------
+# utils
+# ---------------------------
+def _read_yaml(path: str | Path) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return yaml.safe_load(f) or {}
+
+def _sha1(txt: str) -> str:
+    return hashlib.sha1(txt.encode("utf-8")).hexdigest()[:12]
+
+def _load_parquet_glob(glob_path: str | Path) -> pd.DataFrame:
+    import glob
+    files = sorted(glob.glob(str(glob_path)))
+    if not files:
+        raise FileNotFoundError(f"No parquet files matched: {glob_path}")
+    log.info(f"Loading {len(files)} parquet file(s) from: {glob_path}")
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+def _resolve_feature_list(feat_spec: Dict[str, Any],
+                          select: Union[str, list, None],
+                          exclude: Optional[list[str]]) -> list[str]:
+    feats = feat_spec.get("features", feat_spec or {})
+    groups = feats.get("feature_groups", feat_spec.get("feature_groups", {})) or {}
+    all_feats = feats.get("feature_all", feat_spec.get("feature_all", [])) or []
+
+    if not all_feats and groups:
+        seen=set(); out=[]
+        for cols in groups.values():
+            for c in cols:
+                if c not in seen: seen.add(c); out.append(c)
+        all_feats = out
+
+    if isinstance(select, str):
+        s = select.strip()
+        if s.startswith("[") and s.endswith("]"):
+            select = [v.strip().strip("'\"") for v in s[1:-1].split(",") if v.strip()]
+        elif s.lower() in {"all","feature_all","features_all"}:
+            select = None
+
+    if select is None:
+        chosen = list(all_feats)
+    elif isinstance(select, list):
+        chosen=[]; seen=set()
+        for g in select:
+            if g not in groups:
+                raise KeyError(f"Unknown feature group: {g}")
+            for c in groups[g]:
+                if c not in seen: seen.add(c); chosen.append(c)
+    else:
+        raise ValueError("feature_select must be 'all'/'feature_all' or list of groups")
+
+    excl = set(exclude or [])
+    cols = [c for c in chosen if c not in excl]
+    log.info(f"Selected {len(cols)} feature(s).")
+    return cols
+
+def _build_feature_matrix(df: pd.DataFrame, feature_yaml: Dict[str, Any], *,
+                          feature_select: Union[str, list, None],
+                          feature_exclude: Optional[list[str]]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    feats = feature_yaml.get("features", feature_yaml)
+    id_cols = feats.get("id", feature_yaml.get("id", [])) or []
+
+    input_cols = _resolve_feature_list(feature_yaml, feature_select, feature_exclude)
+    missing = [c for c in input_cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing feature columns in data (first 10): {missing[:10]}")
+    iddf = df[id_cols].copy() if id_cols else pd.DataFrame(index=df.index)
+    Xdf  = df[input_cols].copy().apply(pd.to_numeric, errors="coerce").fillna(df[input_cols].mean()).fillna(0.0)
+    log.info(f"Feature matrix shape: {Xdf.shape} (rows, cols)")
+    return Xdf, iddf
+
+def _summarize_scores(scores: np.ndarray) -> Dict[str, float]:
+    s = np.asarray(scores).reshape(-1)
+    return {
+        "score_min": float(np.min(s)),
+        "score_max": float(np.max(s)),
+        "score_mean": float(np.mean(s)),
+        "score_var": float(np.var(s)),
+    }
+
+def _compute_severity(scores: np.ndarray, method: str = "topk", **kwargs) -> float:
+    s = np.asarray(scores).reshape(-1); n = s.size
+    if n == 0: return 0.0
+    if method == "topk":
+        k = int(kwargs.get("k", max(50, int(0.01*n)))); k = max(1, min(k, n))
+        idx = np.argpartition(s, -k)[-k:]
+        return float(np.mean(s[idx]))
+    if method == "percentile":
+        p = float(kwargs.get("p", 99.0)); thr = np.percentile(s, p)
+        sel = s >= thr; return float(np.mean(s[sel])) if np.any(sel) else 0.0
+    if method == "threshold":
+        thr = float(kwargs["threshold"]); sel = s >= thr
+        return float(np.mean(s[sel])) if np.any(sel) else 0.0
+    return float(np.mean(s))
+
+# ---------------------------
+# importable function
+# ---------------------------
+def run_experiment(
+    *,
+    data_glob: str,
+    features_yaml: Union[str, Path, Dict[str, Any]],
+    config: Union[str, Path, Dict[str, Any]],
+    experiment_name: str = "AAA-Experiments",
+    mlflow_uri: Optional[str] = None,
+    feature_select: Union[str, list, None] = "all",
+    feature_exclude: Optional[list[str]] = None,
+    topk_export: int = 200,
+) -> Dict[str, Any]:
+    if mlflow_uri: mlflow.set_tracking_uri(mlflow_uri)
+    mlflow.set_experiment(experiment_name)
+
+    df = _load_parquet_glob(data_glob)
+    feat_spec = features_yaml if isinstance(features_yaml, dict) else _read_yaml(features_yaml)
+    cfg       = config        if isinstance(config, dict)        else _read_yaml(config)
+
+    algo = (cfg.get("algo") or "").strip().lower()
+    if not algo: raise ValueError("Config missing 'algo'")
+    params: Dict[str, Any] = cfg.get("params", {}) or {}
+
+    feature_id = feat_spec.get("id", cfg.get("id", "fs_v1"))
+    cfg_text = yaml.safe_dump(cfg, sort_keys=True)
+    cfg_hash = _sha1(cfg_text)
+
+    Xdf, iddf = _build_feature_matrix(df, feat_spec, feature_select=feature_select, feature_exclude=feature_exclude)
+    X = Xdf.to_numpy(dtype=float)
+
+    pipe, needs_fp = build_pipeline(algo, params)
+
+    run_name = f"{algo}:{cfg_hash}"
+    with mlflow.start_run(run_name=run_name):
+        mlflow.set_tag("algo", algo)
+        mlflow.set_tag("feature_id", feature_id)
+        mlflow.set_tag("config_hash", cfg_hash)
+        mlflow.log_param("feature_select", feature_select if isinstance(feature_select, str) else str(feature_select))
+        mlflow.log_param("feature_exclude", ",".join(feature_exclude or []))
+        mlflow.log_params(params)
+
+        t0 = time.time()
+        if needs_fp: _ = pipe.fit_predict(X)
+        else:        pipe.fit(X)
+        fit_s = time.time() - t0
+        mlflow.log_metric("fit_time_s", fit_s)
+        log.info(f"Fitted {algo} in {fit_s:.3f}s")
+
+        scores = anomaly_scores(algo, pipe, X)  # higher = more anomalous
+        stats = _summarize_scores(scores)
+
+        sev_cfg    = ((cfg.get("metrics") or {}).get("severity") or {})
+        sev_method = sev_cfg.get("method", "topk")
+        sev_args   = sev_cfg.get("args", {}) or {}
+        severity   = _compute_severity(scores, method=sev_method, **sev_args)
+
+        pct_flagged = None
+        if "threshold" in sev_args:
+            thr = float(sev_args["threshold"])
+            pct_flagged = float((np.asarray(scores) >= thr).mean())
+
+        mlflow.log_metrics(stats)
+        mlflow.log_metric("severity", severity)
+        mlflow.set_tag("severity_method", sev_method)
+        for k, v in sev_args.items():
+            mlflow.set_tag(f"severity_arg_{k}", v)
+        if pct_flagged is not None:
+            mlflow.log_metric("pct_flagged", pct_flagged)
+
+        # artifacts
+        art_dir = Path("artifacts/experiment"); art_dir.mkdir(parents=True, exist_ok=True)
+        cfg_out = art_dir / f"config_{cfg_hash}.yaml"; cfg_out.write_text(cfg_text)
+        mlflow.log_artifact(str(cfg_out), artifact_path="configs")
+        feat_text = yaml.safe_dump(feat_spec, sort_keys=True)
+        feat_out = art_dir / f"features_{_sha1(feat_text)}.yaml"; feat_out.write_text(feat_text)
+        mlflow.log_artifact(str(feat_out), artifact_path="features")
+        used_feats = art_dir / f"features_used_{cfg_hash}.txt"; used_feats.write_text("\n".join(list(Xdf.columns)))
+        mlflow.log_artifact(str(used_feats), artifact_path="features")
+
+        s = np.asarray(scores).reshape(-1); k = max(1, min(int(topk_export), s.size))
+        top_idx = np.argsort(-s)[:k]
+        out = (iddf.iloc[top_idx].copy() if not iddf.empty else pd.DataFrame(index=top_idx))
+        out["anomaly_score"] = s[top_idx]
+        topk_path = art_dir / f"topk_{algo}_{cfg_hash}.csv"
+        out.to_csv(topk_path, index=False)
+        mlflow.log_artifact(str(topk_path), artifact_path="reports")
+
+        summary = {
+            "algo": algo,
+            "config_hash": cfg_hash,
+            "n_samples": int(X.shape[0]),
+            "n_features": int(X.shape[1]),
+            "fit_time_s": round(fit_s, 3),
+            "metrics": {
+                **stats,
+                "severity": severity,
+                **({"pct_flagged": pct_flagged} if pct_flagged is not None else {})
+            },
+            "topk_artifact": str(topk_path),
+        }
+        log.info(f"Run summary: {summary['metrics']}")
+        return summary
+
+# ---------------------------
+# CLI wrapper
+# ---------------------------
+def _cli(argv: List[str] | None = None) -> int:
+    ap = argparse.ArgumentParser("AAA experiment runner")
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--features", required=True)
+    ap.add_argument("--config", required=True)
+    ap.add_argument("--experiment-name", default="AAA-Experiments")
+    ap.add_argument("--mlflow-uri", default="file:./mlruns")
+    ap.add_argument("--feature-select", default="all")
+    ap.add_argument("--feature-exclude", default="")
+    ap.add_argument("--topk", type=int, default=200)
+    args = ap.parse_args(argv)
+
+    excl = [s.strip() for s in args.feature_exclude.split(",") if s.strip()]
+    summary = run_experiment(
+        data_glob=args.data,
+        features_yaml=args.features,
+        config=args.config,
+        experiment_name=args.experiment_name,
+        mlflow_uri=args.mlflow_uri,
+        feature_select=args.feature_select,
+        feature_exclude=excl,
+        topk_export=args.topk,
+    )
+    # Single-line JSON for tooling
+    print(json.dumps(summary, separators=(",", ":")))
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())
+    
+#=====================================================================
+# IForest sweep — in-process: calls run_experiment(); logs everywhere
+#=====================================================================
+from __future__ import annotations
+import argparse, json, logging
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import yaml
+import optuna
+import mlflow
+
+from src.aaa.exp.run_experiment import run_experiment
+
+# ---------------------------
+# logging
+# ---------------------------
+def _setup_logger():
+    logger = logging.getLogger("aaa.sweep.iforest")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] [sweep_iforest] %(message)s")
+    sh = logging.StreamHandler(); sh.setFormatter(fmt); logger.addHandler(sh)
+    try:
+        from logging.handlers import RotatingFileHandler
+        import os
+        os.makedirs("logs", exist_ok=True)
+        fh = RotatingFileHandler("logs/pipeline.log", maxBytes=5_000_000, backupCount=3)
+        fh.setFormatter(fmt); logger.addHandler(fh)
+    except Exception:
+        pass
+    return logger
+
+log = _setup_logger()
+
+DEFAULT_EXPERIMENT_NAME = "AAA-Experiments"
+DEFAULT_PRIMARY_METRIC  = "severity"   # or "score_mean"
+DEFAULT_DATA_GLOB       = "data_stream/processed/date_*/part.parquet"
+DEFAULT_FEATURES_YAML   = "configs/features/fs_v1.yaml"
+DEFAULT_BASE_CONFIG     = "configs/experiments/iforest/base.yaml"
+
+def _suggest_params(trial: optuna.Trial) -> Dict[str, Any]:
+    return {
+        "n_estimators":  trial.suggest_int("n_estimators", 100, 800, step=100),
+        "max_samples":   trial.suggest_float("max_samples", 0.4, 1.0),
+        "max_features":  trial.suggest_float("max_features", 0.4, 1.0),
+        "contamination": trial.suggest_float("contamination", 0.01, 0.20),
+        "bootstrap":     trial.suggest_categorical("bootstrap", [False, True]),
+        "random_state":  42,
+        "n_jobs":        -1,
+    }
+
+def _apply_trial_to_config(base_cfg: Dict[str, Any],
+                           params: Dict[str, Any],
+                           tune_severity_k: bool,
+                           trial: optuna.Trial) -> Dict[str, Any]:
+    cfg = dict(base_cfg)
+    cfg["algo"]   = cfg.get("algo", "isolation_forest")
+    cfg["params"] = params
+    if tune_severity_k:
+        k = trial.suggest_int("severity_k", 50, 500, step=50)
+        sev = cfg.setdefault("metrics", {}).setdefault("severity", {})
+        sev.setdefault("method", "topk")
+        sev_args = sev.setdefault("args", {})
+        sev_args["k"] = int(k)
+    return cfg
+
+def main():
+    ap = argparse.ArgumentParser("IForest Optuna sweep (pipeline, in-process)")
+    ap.add_argument("--mlflow-uri", default="file:./mlruns")
+    ap.add_argument("--experiment-name", default=DEFAULT_EXPERIMENT_NAME)
+    ap.add_argument("--primary-metric", default=DEFAULT_PRIMARY_METRIC)
+    ap.add_argument("--n-trials", type=int, default=25)
+    ap.add_argument("--feature-select", default="all")
+    ap.add_argument("--feature-exclude", default="")
+    ap.add_argument("--data-glob", default=DEFAULT_DATA_GLOB)
+    ap.add_argument("--features-yaml", default=DEFAULT_FEATURES_YAML)
+    ap.add_argument("--config-base", default=DEFAULT_BASE_CONFIG)
+    ap.add_argument("--tune-severity-k", action="store_true")
+    ap.add_argument("--study-name", default="iforest_bayes_inproc_v1")
+    ap.add_argument("--storage", default="", help="e.g., sqlite:///optuna/iforest.db")
+    args = ap.parse_args()
+
+    mlflow.set_tracking_uri(args.mlflow_uri)
+    mlflow.set_experiment(args.experiment_name)
+
+    base_cfg = yaml.safe_load(Path(args.config_base).read_text()) or {}
+
+    storage = args.storage or None
+    study = optuna.create_study(
+        direction="maximize",
+        study_name=args.study_name if storage else None,
+        storage=storage,
+        load_if_exists=bool(storage),
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=5),
+    )
+
+    with mlflow.start_run(run_name="iforest_optuna_parent"):
+        mlflow.set_tag("sweep", "iforest_optuna_inproc")
+        mlflow.log_param("primary_metric", args.primary_metric)
+        mlflow.log_param("feature_select", args.feature_select)
+        mlflow.log_param("feature_exclude", args.feature_exclude)
+        mlflow.log_param("tune_severity_k", bool(args.tune_severity_k))
+
+        excl = [s.strip() for s in args.feature_exclude.split(",") if s.strip()]
+
+        def objective(trial: optuna.Trial) -> float:
+            params = _suggest_params(trial)
+            cfg = _apply_trial_to_config(base_cfg, params, args.tune_severity_k, trial)
+
+            with mlflow.start_run(run_name=f"iforest_optuna_trial_{trial.number}", nested=True):
+                mlflow.log_params(params)
+                if args.tune_severity_k:
+                    mlflow.log_param("severity_k", cfg.get("metrics", {}).get("severity", {}).get("args", {}).get("k"))
+
+                summary = run_experiment(
+                    data_glob=args.data_glob,
+                    features_yaml=args.features_yaml,
+                    config=cfg,
+                    experiment_name=args.experiment_name,
+                    mlflow_uri=None,  # already set
+                    feature_select=args.feature_select,
+                    feature_exclude=excl,
+                    topk_export=200,
+                )
+
+                metrics = summary.get("metrics", {})
+                for k, v in metrics.items():
+                    if isinstance(v, (int, float)):
+                        mlflow.log_metric(k, float(v))
+
+                score = float(metrics.get(args.primary_metric, 0.0))
+                mlflow.log_metric("objective", score)
+                log.info(f"[trial {trial.number}] objective={score:.6f}")
+                print(json.dumps({"trial": trial.number, "objective": score}, separators=(",", ":")))
+                return score
+
+        study.optimize(objective, n_trials=args.n_trials, n_jobs=1)
+
+        mlflow.log_params({f"best_{k}": v for k, v in study.best_params.items()})
+        mlflow.log_metric("best_objective", float(study.best_value))
+        log.info(f"Best params: {study.best_params}  best_value={study.best_value:.6f}")
+        print(json.dumps({"best_params": study.best_params, "best_value": study.best_value}, separators=(",", ":")))
+
+if __name__ == "__main__":
+    main()
+    
+    
+
+#=====================================================================
 # Iforest sweep
 #=====================================================================
 from __future__ import annotations
