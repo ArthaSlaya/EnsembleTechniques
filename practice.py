@@ -1,3 +1,324 @@
+export MLFLOW_TRACKING_URI=http://localhost:5000
+
+python -m src.aaa.exp.inference \
+  --data "data_stream/processed/date_*/part.parquet" \
+  --features "configs/features/fs_v1.yaml" \
+  --model-uri "runs:/42af30ad91b14bf59cd861167ae36fa8/model" \
+  --algo isolation_forest \
+  --feature-select all \
+  --out-dir artifacts/inference_best \
+  --return-figs \
+  --log-mlflow
+
+from __future__ import annotations
+import argparse, json
+from pathlib import Path
+from typing import Dict, Any, Optional, Union, Tuple
+
+import numpy as np
+import pandas as pd
+import yaml
+import mlflow
+import mlflow.sklearn
+
+# ---- severity orchestrator + plots (YOUR modules) ----
+from src.aaa.exp.severity.severity_handler import run_severity_handler
+from src.aaa.exp.severity.severity_plots import (
+    plot_severity_trend_gold,
+    plot_component_trend_gold,
+    plot_daily_severe_device_counts_gold,
+    plot_daily_stat_anomaly_counts_gold,
+)
+
+# =========================
+# Helpers
+# =========================
+def _read_yaml(path: str | Path) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        return yaml.safe_load(f) or {}
+
+def _load_parquet_glob(glob_path: str | Path) -> pd.DataFrame:
+    import glob
+    files = sorted(glob.glob(str(glob_path)))
+    if not files:
+        raise FileNotFoundError(f"No parquet matched: {glob_path}")
+    return pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+def _resolve_feature_list(
+    feat_spec: Dict[str, Any],
+    select: Union[str, list[str], None],
+    exclude: Optional[list[str]] = None
+) -> list[str]:
+    """
+    Works with:
+      A) {features:{feature_groups:..., feature_all:[...]}}
+      B) {feature_groups:..., feature_all:[...]}
+    select: "all"/"feature_all" | "SC" | ["SC","SS"] | "SC,SS"
+    """
+    feats   = feat_spec.get("features", feat_spec or {})
+    groups  = feats.get("feature_groups", feat_spec.get("feature_groups", {})) or {}
+    all_ft  = feats.get("feature_all", feat_spec.get("feature_all", [])) or []
+
+    if not all_ft and groups:
+        seen, out = set(), []
+        for cols in groups.values():
+            for c in cols:
+                if c not in seen:
+                    seen.add(c); out.append(c)
+        all_ft = out
+
+    # normalize select → list[str] | None (None means "all")
+    if select is None or (isinstance(select, str) and select.lower() in {"all","feature_all","features_all"}):
+        sel = None
+    elif isinstance(select, list):
+        sel = select
+    elif isinstance(select, str):
+        s = select.strip()
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                import ast
+                sel = list(ast.literal_eval(s))
+            except Exception:
+                sel = [v.strip().strip("'\"") for v in s[1:-1].split(",") if v.strip()]
+        elif "," in s:
+            sel = [v.strip() for v in s.split(",") if v.strip()]
+        else:
+            sel = [s]
+    else:
+        raise ValueError("feature_select must be None, str, or list")
+
+    if sel is None:
+        chosen = list(all_ft)
+    else:
+        chosen, seen = [], set()
+        for g in sel:
+            cols = groups[g] if g in groups else [g]  # allow passing actual column name
+            for c in cols:
+                if c not in seen:
+                    seen.add(c); chosen.append(c)
+
+    excl = set(exclude or [])
+    final = [c for c in chosen if c not in excl]
+    if not final:
+        raise RuntimeError("No features selected — check feature_select/YAML.")
+    return final
+
+def _build_feature_matrix(
+    df: pd.DataFrame,
+    feat_yaml: Dict[str, Any],
+    *, feature_select: Union[str, list, None] = "all",
+    feature_exclude: Optional[list[str]] = None
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    feats = feat_yaml.get("features", feat_yaml)
+    id_cols = (feats.get("id_columns") or feat_yaml.get("id_columns")
+               or feats.get("id") or feat_yaml.get("id") or [])
+    inputs = _resolve_feature_list(feat_yaml, feature_select, feature_exclude)
+    missing = [c for c in inputs if c not in df.columns]
+    if missing:
+        raise KeyError(f"Missing feature columns (first 10): {missing[:10]}")
+    iddf = df[id_cols].copy() if id_cols else pd.DataFrame(index=df.index)
+    Xdf = df[inputs].copy()
+    Xdf = Xdf.apply(pd.to_numeric, errors="coerce").fillna(Xdf.mean()).fillna(0.0)
+    return Xdf, iddf
+
+def _inline_scores(pipe, algo: str, X: np.ndarray) -> np.ndarray:
+    """
+    HIGHER = MORE ANOMALOUS
+    Supports IsolationForest and LOF (novelty or classic-on-same-data).
+    """
+    a = (algo or "").lower()
+    if a == "isolation_forest":
+        return -np.asarray(pipe["model"].score_samples(X)).reshape(-1)
+    if a == "lof":
+        model = pipe["model"]
+        if getattr(model, "novelty", False):
+            return -np.asarray(model.decision_function(X)).reshape(-1)
+        if not hasattr(model, "negative_outlier_factor_"):
+            raise RuntimeError("LOF classic cannot score new data; needs fit_predict(X) first.")
+        return -np.asarray(model.negative_outlier_factor_).reshape(-1)
+    if hasattr(pipe, "decision_function"):
+        return -np.asarray(pipe.decision_function(X)).reshape(-1)
+    if hasattr(pipe, "score_samples"):
+        return -np.asarray(pipe.score_samples(X)).reshape(-1)
+    raise ValueError(f"Unsupported algo for scoring: {algo}")
+
+def _ensure_dir(p: Union[str, Path]) -> Path:
+    p = Path(p); p.mkdir(parents=True, exist_ok=True); return p
+
+# =========================
+# Public API
+# =========================
+def load_pipeline(model_uri: str):
+    """
+    Load MLflow-logged sklearn Pipeline.
+      - runs:/<RUN_ID>/model
+      - models:/<NAME>/<Stage>
+      - local path
+    """
+    return mlflow.sklearn.load_model(model_uri)
+
+def run_inference_and_severity(
+    *,
+    data_glob: str,
+    features_yaml: Union[str, Path, Dict[str, Any]],
+    model_uri: str,
+    algo: str,                                   # "isolation_forest" | "lof"
+    feature_select: Union[str, list, None] = "all",
+    feature_exclude: Optional[list[str]] = None,
+    severity_config: Optional[str] = "severity/severity_config.yaml",
+    severity_overrides: Optional[Dict[str, Any]] = None,
+    out_dir: Union[str, Path] = "artifacts/inference",
+    topk: int = 200,
+    do_plots: bool = True,
+    return_figs: bool = False,
+    log_mlflow: bool = False,                    # optional MLflow logging
+) -> Dict[str, Any]:
+    outp = _ensure_dir(out_dir)
+
+    # 1) Load data + features
+    df = _load_parquet_glob(data_glob)
+    feat_spec = features_yaml if isinstance(features_yaml, dict) else _read_yaml(features_yaml)
+    Xdf, iddf = _build_feature_matrix(df, feat_spec,
+                                      feature_select=feature_select,
+                                      feature_exclude=feature_exclude)
+    X = Xdf.to_numpy(dtype=float)
+
+    # 2) Load model + score
+    pipe = load_pipeline(model_uri)
+    scores = _inline_scores(pipe, algo, X)
+
+    # 3) Compose dataframe for severity (ids + optionally features/flags)
+    df_base = pd.concat([iddf.reset_index(drop=True), Xdf.reset_index(drop=True)], axis=1)
+    df_base["anomaly_score"] = scores
+
+    # 4) Severity handler + plotters (YOUR modules)
+    plotters = {
+        "plot_severity_trend_gold": plot_severity_trend_gold,
+        "plot_component_trend_gold": plot_component_trend_gold,
+        "plot_daily_severe_device_counts_gold": plot_daily_severe_device_counts_gold,
+        "plot_daily_stat_anomaly_counts_gold": plot_daily_stat_anomaly_counts_gold,
+    }
+
+    sev_kwargs = dict(
+        df=df_base,
+        config_path=severity_config,
+        plotters=plotters,
+        do_plots=do_plots,
+        return_figs=return_figs,
+    )
+    if severity_overrides:
+        # pass-through known overrides only
+        keys = {
+            "z_cols","weights","flag_cols","persistence_col",
+            "date_col","device_col","severity_col","label_col",
+            "tanh_scale","label_bins","severity_threshold","rolling_days",
+            "scales","methods","polarity","use_abs",
+        }
+        sev_kwargs.update({k: v for k, v in severity_overrides.items() if k in keys})
+
+    sev_out = run_severity_handler(**sev_kwargs)
+
+    # 5) Persist outputs
+    scored = df_base.copy()
+    scored_path = outp / "scored_with_severity.csv"
+    scored.to_csv(scored_path, index=False)
+
+    k = max(1, min(int(topk), scored.shape[0]))
+    top_idx = np.argsort(-scores)[:k]
+    topk_df = scored.iloc[top_idx].copy()
+    topk_path = outp / f"topk_{algo}.csv"
+    topk_df.to_csv(topk_path, index=False)
+
+    # Optional: persist plots to PNG if available
+    plot_paths = {}
+    if return_figs and sev_out.get("figs"):
+        import matplotlib.pyplot as plt  # your plots are Matplotlib
+        plot_dir = _ensure_dir(outp / "plots")
+        for name, fig in sev_out["figs"].items():
+            if fig is None:
+                continue
+            png = plot_dir / f"{name}.png"
+            try:
+                fig.savefig(str(png), bbox_inches="tight")
+                plot_paths[name] = str(png)
+            finally:
+                plt.close(fig)
+
+    # 6) (Optional) Log to MLflow
+    if log_mlflow:
+        active = mlflow.active_run()
+        # Use nested run if a parent is active (e.g., called from a sweep or batch)
+        with mlflow.start_run(run_name="inference+severity", nested=bool(active)):
+            mlflow.set_tag("phase", "inference")
+            mlflow.set_tag("algo", algo)
+            mlflow.log_param("feature_select", feature_select if isinstance(feature_select, str) else str(feature_select))
+            mlflow.log_param("feature_exclude", ",".join(feature_exclude or []))
+            mlflow.log_metric("n_rows", float(scored.shape[0]))
+            mlflow.log_metric("score_mean", float(np.mean(scores)))
+            mlflow.log_metric("score_p95", float(np.percentile(scores, 95)))
+            # artifacts
+            mlflow.log_artifact(str(scored_path), artifact_path="reports")
+            mlflow.log_artifact(str(topk_path), artifact_path="reports")
+            # plot files
+            for name, pth in plot_paths.items():
+                mlflow.log_artifact(pth, artifact_path=f"plots/{name}")
+
+    return {
+        "scored_csv": str(scored_path),
+        "topk_csv": str(topk_path),
+        "df_sev": sev_out.get("df_sev"),
+        "daily_anom": sev_out.get("daily_anom"),
+        "daily_sev": sev_out.get("daily_sev"),
+        "plot_paths": plot_paths,
+    }
+
+# =========================
+# CLI
+# =========================
+def _cli(argv=None) -> int:
+    ap = argparse.ArgumentParser("AAA Inference + Severity")
+    ap.add_argument("--data", required=True, help="Parquet glob for inference data")
+    ap.add_argument("--features", required=True, help="Feature YAML (fs_v1.yaml)")
+    ap.add_argument("--model-uri", required=True, help="MLflow model URI (runs:/... or models:/...)")
+    ap.add_argument("--algo", required=True, help="Model algo: isolation_forest | lof")
+    ap.add_argument("--feature-select", default="all")
+    ap.add_argument("--feature-exclude", default="")
+    ap.add_argument("--severity-config", default="severity/severity_config.yaml")
+    ap.add_argument("--out-dir", default="artifacts/inference")
+    ap.add_argument("--topk", type=int, default=200)
+    ap.add_argument("--no-plots", action="store_true")
+    ap.add_argument("--return-figs", action="store_true")
+    ap.add_argument("--log-mlflow", action="store_true")
+    args = ap.parse_args(argv)
+
+    excl = [s.strip() for s in args.feature_exclude.split(",") if s.strip()]
+    res = run_inference_and_severity(
+        data_glob=args.data,
+        features_yaml=args.features,
+        model_uri=args.model_uri,
+        algo=args.algo,
+        feature_select=args.feature_select,
+        feature_exclude=excl,
+        severity_config=args.severity_config,
+        out_dir=args.out_dir,
+        topk=args.topk,
+        do_plots=(not args.no_plots),
+        return_figs=args.return_figs,
+        log_mlflow=args.log_mlflow,
+    )
+
+    print(json.dumps({
+        "scored_csv": res["scored_csv"],
+        "topk_csv": res["topk_csv"],
+        "n_rows": int(pd.read_csv(res["scored_csv"]).shape[0]),
+    }, indent=2))
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())
+    
+
+
 python -m src.aaa.exp.run_experiment \
   --data "data_stream/processed/date_*/part.parquet" \
   --features "configs/features/fs_v1.yaml" \
