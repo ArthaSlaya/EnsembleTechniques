@@ -338,20 +338,190 @@ python train.py --data data/tiny_shakespeare.txt --tokenizer char --vocab-size 1
 python train.py --data data/tiny_shakespeare.txt --tokenizer word --vocab-size 20000 --tok-file artifacts/tok_word.json --lowercase
 python train.py --data data/tiny_shakespeare.txt --tokenizer bpe --vocab-size 8000 --tok-file artifacts/tok_bpe.json
 
-# prep_bible.py
+# prep_bible_clean.py
 from pathlib import Path
 import re
+import textwrap
 
-raw = Path("data/kjv_raw.txt").read_text(encoding="utf-8")
+RAW_PATH = "data/kjv_raw.txt"           # your raw Gutenberg txt
+OUT_PATH = "data/bible_corpus_clean.txt"
 
-# remove Gutenberg headers/footers (rough but works for KJV HTML->txt dumps)
-start = re.search(r"^Genesis 1:1", raw, flags=re.M)
+# --- 1) Load raw ---
+raw = Path(RAW_PATH).read_text(encoding="utf-8")
+
+# --- 2) Trim Gutenberg front/back using anchors (fallbacks included) ---
+start = (re.search(r"^Genesis 1:1", raw, flags=re.M)
+         or re.search(r"^The First Book of Moses.*Genesis", raw, flags=re.M|re.I))
 end   = re.search(r"^Revelation 22:21", raw, flags=re.M)
-text  = raw[start.start(): end.end()] if start and end else raw
+txt   = raw[start.start(): end.end()] if (start and end) else raw
 
-# optional: normalize whitespace
-text = re.sub(r"[ \t]+", " ", text)
-text = re.sub(r"\n{3,}", "\n\n", text).strip()
+# --- 3) Remove headings (all 66 + generic headings) ---
+BOOK_HEADINGS = [
+    # Old Testament (39)
+    "The First Book of Moses: Called Genesis",
+    "The Second Book of Moses: Called Exodus",
+    "The Third Book of Moses: Called Leviticus",
+    "The Fourth Book of Moses: Called Numbers",
+    "The Fifth Book of Moses: Called Deuteronomy",
+    "The Book of Joshua",
+    "The Book of Judges",
+    "The Book of Ruth",
+    "The First Book of Samuel",
+    "The Second Book of Samuel",
+    "The First Book of the Kings",
+    "The Second Book of the Kings",
+    "The First Book of the Chronicles",
+    "The Second Book of the Chronicles",
+    "Ezra",
+    "The Book of Nehemiah",
+    "The Book of Esther",
+    "The Book of Job",
+    "The Book of Psalms",
+    "The Proverbs",
+    "Ecclesiastes",
+    "The Song of Solomon",
+    "The Book of the Prophet Isaiah",
+    "The Book of the Prophet Jeremiah",
+    "The Lamentations of Jeremiah",
+    "The Book of the Prophet Ezekiel",
+    "The Book of Daniel",
+    "Hosea",
+    "Joel",
+    "Amos",
+    "Obadiah",
+    "Jonah",
+    "Micah",
+    "Nahum",
+    "Habakkuk",
+    "Zephaniah",
+    "Haggai",
+    "Zechariah",
+    "Malachi",
+    # New Testament (27)
+    "The Gospel According to Saint Matthew",
+    "The Gospel According to Saint Mark",
+    "The Gospel According to Saint Luke",
+    "The Gospel According to Saint John",
+    "The Acts of the Apostles",
+    "The Epistle of Paul the Apostle to the Romans",
+    "The First Epistle of Paul the Apostle to the Corinthians",
+    "The Second Epistle of Paul the Apostle to the Corinthians",
+    "The Epistle of Paul the Apostle to the Galatians",
+    "The Epistle of Paul the Apostle to the Ephesians",
+    "The Epistle of Paul the Apostle to the Philippians",
+    "The Epistle of Paul the Apostle to the Colossians",
+    "The First Epistle of Paul the Apostle to the Thessalonians",
+    "The Second Epistle of Paul the Apostle to the Thessalonians",
+    "The First Epistle of Paul the Apostle to Timothy",
+    "The Second Epistle of Paul the Apostle to Timothy",
+    "The Epistle of Paul the Apostle to Titus",
+    "The Epistle of Paul the Apostle to Philemon",
+    "The Epistle of Paul the Apostle to the Hebrews",
+    "The General Epistle of James",
+    "The First Epistle General of Peter",
+    "The Second General Epistle of Peter",
+    "The First Epistle General of John",
+    "The Second Epistle General of John",
+    "The Third Epistle General of John",
+    "The General Epistle of Jude",
+    "The Revelation of Saint John the Divine",
+]
+# build a single regex from exact headings (anchor full line, ignore-case)
+heading_exact = re.compile(r"^(?:" + "|".join(re.escape(h) for h in BOOK_HEADINGS) + r")\s*$",
+                           flags=re.M | re.I)
 
-Path("data/bible_corpus.txt").write_text(text, encoding="utf-8")
-print("Saved:", "data/bible_corpus.txt", "chars:", len(text))
+# generic headings that appear in many KJV prints
+generic_headings = re.compile(
+    r"^(?:The Old Testament of the King James.*|The New Testament of the King James.*|"
+    r"Chapter\s+\d+|CHAPTER\s+\d+|PSALM\s+\d+|A Psalm of.*|¶.*)$",
+    flags=re.M | re.I
+)
+
+txt = heading_exact.sub("", txt)
+txt = generic_headings.sub("", txt)
+
+# --- 4) Remove leading verse prefixes on each line (Book C:V / bare C:V / lone verse numbers) ---
+# e.g., "Genesis 1:1 In the beginning..."  or  "1:1 In the beginning..."  or  "23 ..."
+line_prefix_patterns = [
+    r"^(?:[1-3]\s+)?[A-Za-z][A-Za-z .'-]+?\s+\d+:\d+\s+",  # Book Name + C:V
+    r"^\d+:\d+\s+",                                        # bare C:V
+    r"^\d+\s+$",                                           # line that is just a number
+]
+for pat in line_prefix_patterns:
+    txt = re.sub(pat, "", txt, flags=re.M)
+
+# Remove inline references anywhere: "(John 3:16)" or "—John 3:16"
+txt = re.sub(r"\(?[A-Za-z][A-Za-z .'-]+?\s+\d+:\d+\)?", "", txt)
+txt = re.sub(r"—\s*[A-Za-z][A-Za-z .'-]+?\s+\d+:\d+", "", txt)
+
+# Nuke any leftover C:V patterns, just in case
+txt = re.sub(r"\b\d+:\d+\b", "", txt)
+
+# OPTIONAL ultra-strict: remove all digits (uncomment if you want zero numerals)
+# txt = re.sub(r"\d+", "", txt)
+
+# --- 5) Normalize whitespace (collapse multi-blank lines; trim spaces) ---
+txt = re.sub(r"[ \t]+", " ", txt)
+txt = re.sub(r"\n{3,}", "\n\n", txt)
+txt = re.sub(r"[ \t]*\n[ \t]*", "\n", txt).strip()
+
+# --- 6) P3 HYBRID LINE-BREAK LOGIC ---
+# We break on punctuation (., !, ?, ;, :) AND also insert gentle breaks before/after certain verbs/phrases.
+TRIGGERS = [
+    r"\b(spake|said|cried|sang|proclaimed|answered|replied|called|blessed|praised|lamented|"
+    r"commanded|declared|testified|exhorted|rebuked|forsook|repented|believed|rejoiced)\b",
+    r"\b(behold|verily|amen|selah)\b",
+]
+# 6a) Add a marker after sentence-level punctuation for reflow
+txt = re.sub(r"([.!?;:])\s+", r"\1 <SPLIT> ", txt)
+
+# 6b) Add markers around trigger words to encourage poetic cadence
+for pat in TRIGGERS:
+    # split *before* and *after* triggers, but keep the word
+    txt = re.sub(rf"\s*({pat})\s*", r" <SPLIT>\1<SPLIT> ", txt, flags=re.I)
+
+# 6c) Build paragraphs with soft line-wrapping + trigger-aware short lines
+def reflow_mixed(text: str, wrap_width: int = 100) -> str:
+    blocks = [b.strip() for b in text.split("\n\n") if b.strip()]
+    out_blocks = []
+    for b in blocks:
+        # first, rewrap to tidy long runs
+        b_wrapped = " ".join(textwrap.fill(b, width=wrap_width).split())
+        # split on our markers
+        parts = [p.strip() for p in b_wrapped.split("<SPLIT>") if p.strip()]
+        lines = []
+        buf = ""
+        for p in parts:
+            # if short phrase (trigger vicinity) or ends with strong punctuation, flush as its own line
+            strong_end = bool(re.search(r"[.!?;:]$", p))
+            near_trigger = bool(re.search(r"^(?i)(spake|said|cried|sang|proclaimed|answered|replied|called|"
+                                          r"blessed|praised|lamented|commanded|declared|testified|exhorted|"
+                                          r"rebuked|forsook|repented|believed|rejoiced|behold|verily|amen|selah)\b", p))
+            if near_trigger or len(p) <= 60 or strong_end:
+                if buf:
+                    lines.append(buf.strip())
+                    buf = ""
+                lines.append(p.strip())
+            else:
+                # accumulate into paragraph line
+                if len(buf) + 1 + len(p) <= wrap_width:
+                    buf = (buf + " " + p).strip() if buf else p
+                else:
+                    lines.append(buf.strip())
+                    buf = p
+        if buf:
+            lines.append(buf.strip())
+        out_blocks.append("\n".join(lines))
+    return "\n\n".join(out_blocks) + "\n"
+
+clean = reflow_mixed(txt, wrap_width=100)
+
+# --- 7) Final safety checks ---
+res_cv = re.findall(r"\b\d+:\d+\b", clean)
+res_head = re.findall(r"^(?:Chapter\s+\d+|CHAPTER\s+\d+|PSALM\s+\d+)$", clean, flags=re.M)
+print("Residual C:V refs:", len(res_cv))
+print("Residual CHAPTER/PSALM headings:", len(res_head))
+
+# --- 8) Save ---
+Path(OUT_PATH).write_text(clean, encoding="utf-8")
+print(f"Saved: {OUT_PATH}  chars: {len(clean):,}")
