@@ -1,3 +1,188 @@
+# Severity Metric – Gold Layer Calculation & Future Inference Integration
+
+**Owner:** Your Name  
+**Location:** IoT Network AI Home → Anomaly Detection Project → Severity Metric Documentation  
+**Last Updated:** _(auto)_
+
+---
+
+## Overview
+The **Severity Metric** quantifies abnormality or risk on a 0–1 scale and classifies results into **Low**, **Medium**, or **High** severity.  
+In this design:
+
+- The **Gold Layer** version is the **primary and authoritative** severity metric.
+- The **Inference Layer** is **optional** and can incorporate **model-based scores** for advanced behavior in the future.
+
+This document explains the **calculation**, **inputs**, and **future extensibility** of the metric.
+
+---
+
+## Page Hierarchy (Confluence Context)
+
+```
+IoT Network AI Home
+└── Anomaly Detection Project
+     └── Severity Metric Documentation
+```
+
+---
+
+## Design Goals
+
+- **Explainable:** All component and final scores are bounded in [0,1].  
+- **Modular:** New signals or model outputs can be added easily.  
+- **Config-driven:** Parameter tuning done externally; no code change required.  
+- **Future-ready:** Optional integration with ML-based inference pipelines.
+
+---
+
+## Gold Layer Calculation
+
+### Inputs
+
+| Input | Type | Description |
+|-------|------|--------------|
+| `z_cols` | Dict[str, str] | Mapping of *component name → raw column* (e.g., `{"ZB": "zb_zscore", "IF": "if_raw"}`) |
+| `weights` | Dict[str, float] | Importance per component; normalized to sum to 1 |
+| `scales` | Dict[str, float] (opt) | Controls sensitivity; smaller = sharper |
+| `methods` | Dict[str, str] (opt) | Squashing method: `tanh`, `logistic`, or `linear` |
+| `polarity` | Dict[str, int] (opt) | `+1` if higher=worse, `-1` if higher=better |
+| `use_abs` | Dict[str, bool] (opt) | Apply absolute value before squashing |
+| `flag_cols` | List[str] (opt) | Binary flags (e.g., SLA breach) |
+| `persistence_col` | str (opt) | Rolling or persistence factor in [0,1] |
+
+### Step 1: Component Scoring
+
+Each raw signal is normalized to [0,1] using one of:
+
+| Function | Formula | Notes |
+|-----------|----------|-------|
+| `tanh` | `tanh(|z| / scale)` | Smooth, stable |
+| `logistic` | `1 / (1 + exp(-|z| / scale))` | Steep near zero |
+| `linear` | `min(|z| / scale, 1)` | Simple, capped ramp |
+
+Per-component parameters (`scale`, `polarity`, `use_abs`) determine exact behavior.  
+Outputs: `ZB_score`, `IF_score`, `BU_score`, etc.
+
+### Step 2: Weighted Core Blend
+
+\`\`\`
+Severity_S0 = Σ (weight_i × component_score_i)
+\`\`\`
+All weights are normalized; result is a baseline severity in [0,1].
+
+### Step 3: Flags and Persistence
+
+| Term | Description | Coefficient |
+|-------|-------------|--------------|
+| **Flags (B)** | Average of flag columns (0/1) | β = 0.10 |
+| **Persistence (P)** | Rolling continuity factor [0,1] | γ = 0.05 |
+| **Core Blend (S₀)** | Weighted component severity | α = 0.85 |
+
+Final calculation:
+\`\`\`
+Severity_final = α × S₀ + β × B + γ × P
+\`\`\`
+
+### Step 4: Labeling
+
+| Range | Label | Meaning |
+|--------|--------|----------|
+| 0.00–0.30 | Low | Normal |
+| 0.30–0.70 | Medium | Degraded |
+| 0.70–1.00 | High | Critical |
+
+---
+
+## Example (Gold Layer)
+
+```python
+z_cols   = {"ZB":"zb_zscore", "IF":"if_raw", "BU":"backlog_delta_z"}
+weights  = {"ZB":0.4, "IF":0.4, "BU":0.2}
+scales   = {"IF":1.2, "BU":2.0}
+methods  = {"ZB":"tanh", "IF":"logistic", "BU":"linear"}
+flag_cols = ["is_critical", "is_sla_breached"]
+persistence_col = "persist_7d"
+
+out = compute_severity(
+  df,
+  z_cols=z_cols,
+  weights=weights,
+  scales=scales,
+  methods=methods,
+  flag_cols=flag_cols,
+  persistence_col=persistence_col,
+  alpha_core=0.85, beta_flags=0.10, gamma_persist=0.05,
+  severity_name="Severity_final",
+  label_name="Severity_label",
+  label_bins=(0.30, 0.70),
+)
+```
+
+---
+
+## Inference Layer (Future Integration)
+
+Future inference pipelines can enhance the metric using ML-based anomaly or risk scores.
+
+### Integration Pattern
+
+- Treat the model score as an additional component:
+```python
+z_cols["ML"]  = "model_pred_score"
+weights["ML"] = 0.25
+methods["ML"] = "linear"
+```
+- Keep other components unchanged; weights auto-normalize.  
+- Supports IsolationForest, AutoEncoder, or neural anomaly detectors.  
+- Combine outputs to produce **hybrid severity** (Gold + Model).
+
+---
+
+## Parameter Guidelines
+
+| Setting | Use Case |
+|----------|-----------|
+| `logistic` + small `scale` | Sharper response for small deviations |
+| `tanh` + medium `scale` | Smooth, general-purpose |
+| `linear` | Simple and interpretable |
+| `polarity = -1` | Flip for metrics where higher = better |
+| Increase `β` / `γ` | Emphasize flags or persistence |
+
+---
+
+## Validation Checklist
+
+- [ ] All scores (`*_score`, `Severity_S0`, `Severity_final`) ∈ [0,1]  
+- [ ] Keys in `weights` == keys in `z_cols`  
+- [ ] Label distribution balanced (no collapse)  
+- [ ] Compare before/after histograms of Severity_final  
+- [ ] Document change in Version History and link to PR
+
+---
+
+## Version History
+
+| Date | Change | Author | PR |
+|------|---------|--------|----|
+| YYYY-MM-DD | Initial baseline (ZB, IF, BU with α/β/γ = 0.85/0.10/0.05) | Your Name | PR-### |
+| YYYY-MM-DD | Added ML model score as optional component | Your Name | PR-### |
+
+---
+
+## Governance
+
+- **Gold Layer** = canonical severity source.  
+- **Inference Layer** = optional enhancement after validation.  
+- Changes require:
+  1. PR with justification and tests  
+  2. Update to this document and Confluence page  
+  3. Stakeholder review before deployment.
+
+---
+
+**End of Document**
+
 (aaa-pipeline-practice) bellsi1@DQ47NX2KJ5 AAA_Pipeline_Practice % python -m src.aaa.exp.run_inference \
   --data "data_stream/processed/date_*/part.parquet" \
   --features "configs/features/fs_v1.yaml" \
